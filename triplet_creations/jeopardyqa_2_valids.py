@@ -45,9 +45,18 @@ if __name__ == '__main__':
     node_data = load_pandas(args.nodes_data_path)
     
     nodes = set(triplets['head'].tolist()) | set(triplets['tail'].tolist())
+
+    questions_qids = jeopardy_df['Question-Qid']
+    answers_qids = jeopardy_df['Answer-Qid']
+
+    assert isinstance(questions_qids, pd.Series), "Question-Qid column is not a pandas Series"
+    assert isinstance(answers_qids, pd.Series), "Answer-Qid column is not a pandas Series"
     
-    jeopardy_questions = extract_literals(jeopardy_df['Question-Qid'])
-    jeopardy_answers = extract_literals(jeopardy_df['Answer-Qid'])
+    jeopardy_questions = extract_literals(questions_qids)
+    jeopardy_answers = extract_literals(answers_qids)
+
+    assert isinstance(jeopardy_questions, pd.Series), "Later on jeopardy_questions is expected to be a series, and thus needs to be checked against being a list"
+    assert isinstance(jeopardy_answers, pd.Series), "Later on jeopardy_answers is expected to be a series, and thus needs to be checked against being a list"
     
     # Create a new DataFrame to store filtered rows
     filtered_rows = []
