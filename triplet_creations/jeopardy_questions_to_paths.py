@@ -18,7 +18,7 @@ from tqdm import tqdm
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from typing import List, Tuple, Any
+from typing import List, Optional, Tuple, Any
 
 from utils.configs import global_configs
 from utils.basic import load_pandas, overload_parse_defaults_with_yaml
@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
                         help='Name of the Neo4j database to use.')
 
     # General Parameters
-    parser.add_argument('--max-relevant-relations', type=int, default=25, #25 is the ideal value
+    parser.add_argument('--max-relevant-relations', type=int, default=None, #25 is the ideal value
                         help='How many relevant relations to extract through nearest neighbors.')
     parser.add_argument('--max-questions', type=int, default=None,
                         help='Max number of jeopardy questions to use. For all, use None.')
@@ -116,14 +116,17 @@ if __name__ == '__main__':
     'Instantiating Models and Loading Data'
     
     # Question, Embedding, and ANN models
-    embedding_gpt = OpenAIHandler(model=args.embedding_model, encoding=args.encoding_model)
-    
-    ann = FbWikiANN(
-            data_path = args.relation_data_path,
-            embedding_path = args.relation_embeddings_path, 
-            exact_computation = args.ann_exact_computation,
-            nlist=args.ann_nlist
-            )
+    if args.max_relevant_relations is not None:
+
+        embedding_gpt = OpenAIHandler(model=args.embedding_model, encoding=args.encoding_model)
+        ann = FbWikiANN(
+                data_path = args.relation_data_path,
+                embedding_path = args.relation_embeddings_path, 
+                exact_computation = args.ann_exact_computation,
+                nlist=args.ann_nlist
+                )
+    else:
+        ann = None
     
     g = FbWikiGraph(neo4j_parameters['uri'], neo4j_parameters['user'],
                     neo4j_parameters['password'], database = args.database)
@@ -162,10 +165,13 @@ if __name__ == '__main__':
             log_output.append(f"Answer: {node_data_df.loc[answers[0]]['Title']}")
             log_output.append(f"Entities: {node_data_df.loc[q_ids]['Title'].tolist()}")
         
-        embeddings = np.array(embedding_gpt.get_embedding(question))[None,:]
-        _, indices = ann.search(embeddings, args.max_relevant_relations)
-        
-        p_ids        = list(set(ann.index2data(indices, 'Property', max_indices=args.max_relevant_relations)[0]))
+        if ann is not None:
+            embeddings = np.array(embedding_gpt.get_embedding(question))[None,:]
+            _, indices = ann.search(embeddings, args.max_relevant_relations)
+            p_ids        = list(set(ann.index2data(indices, 'Property', max_indices=args.max_relevant_relations)[0]))
+        else:
+            p_ids = None
+
         
         paths = []
         # question nodes and answer node
