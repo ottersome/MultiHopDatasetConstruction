@@ -506,7 +506,7 @@ class FbWikiGraph():
         min_hops: int = 2,
         max_hops: int = 3,
         limit: int = 1,
-        relationship_types: List[str] = None,
+        relationship_types: Optional[list[str]] = None,
         noninformative_types: List[str] = [],
         qid_only: bool = False,
         rand: bool = False,
