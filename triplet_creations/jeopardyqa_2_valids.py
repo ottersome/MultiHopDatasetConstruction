@@ -12,6 +12,7 @@ Summary: Filters Jeopardy questions to retain only those compatible with the des
 import argparse
 
 import pandas as pd
+from tqdm import tqdm
 
 from utils.basic import load_pandas, load_triplets, extract_literals
 
@@ -23,13 +24,13 @@ def parse_args() -> argparse.Namespace:
     # Input
     parser.add_argument('--jeopardy-path', type=str, default='./data/jeopardy_processed_bert.csv',
                         help='Path to the CSV file containing processed Jeopardy questions with associated QIDs.')
-    parser.add_argument('--triplet-path', type=str, default='./data/triplets_fj_wiki.txt',
+    parser.add_argument('--triplets-path', type=str, default='./data/triplets_fb_wiki_v2.txt',
                         help='Path to the text file containing valid triplets of entities used for filtering.')
-    parser.add_argument('--nodes-data-path', type=str, default='./data/node_data_fj_wiki.csv',
+    parser.add_argument('--nodes-data-path', type=str, default='./data/node_data_fb_wiki.csv',
                         help='Path to the CSV file containing node data, including the respective entity name for each QID.')
     
     # Output
-    parser.add_argument('--jeopardy-output-path', type=str, default='./data/jeopardy_fj_wiki.csv',
+    parser.add_argument('--jeopardy-output-path', type=str, default='./data/jeopardy_fb_wiki_alt.csv',
                         help='Path to save the filtered Jeopardy questions containing entities that match the target dataset.')
     
     return parser.parse_args()
@@ -41,6 +42,7 @@ if __name__ == '__main__':
     #--------------------------------------------------------------------------
     
     jeopardy_df = load_pandas(args.jeopardy_path)
+    jeopardy_df_num_rows = jeopardy_df.shape[0]
     triplets = load_triplets(args.triplets_path)
     node_data = load_pandas(args.nodes_data_path)
     
@@ -61,7 +63,7 @@ if __name__ == '__main__':
     # Create a new DataFrame to store filtered rows
     filtered_rows = []
     
-    for j, (i0, row) in enumerate(jeopardy_df.iterrows()):
+    for j, (i0, row) in tqdm(enumerate(jeopardy_df.iterrows()), total=jeopardy_df_num_rows, desc="Iterating through rows of unfiltered jeopardy dataset"):
 
         q_rdfs = set(jeopardy_questions.iloc[i0])
         a_rdfs = set(jeopardy_answers.iloc[i0])

@@ -45,7 +45,7 @@ def parse_args() -> argparse.Namespace:
                         help='Path to the CSV file containing relationship data')
     parser.add_argument('--relation-embeddings-path', type=str, default='./data/relationship_embeddings_gpt_subgraph_full.csv',
                         help='Path to the CSV file containing the relationships embeddings.')
-    parser.add_argument('--database', type=str, default='subgraph',
+    parser.add_argument('--database', type=str, default='neo4j',
                         help='Name of the Neo4j database to use.')
 
     # General Parameters
@@ -65,6 +65,8 @@ def parse_args() -> argparse.Namespace:
                         help='Maximum number of hops to consider in the path.')
     parser.add_argument('--num-workers', type=int, default=10,
                         help='Number of workers to use for path extractions.')
+    parser.add_argument('--path_return_limit', type=int, default=1,
+                        help='Maximum number of paths to return for each node pair.')
     
     # ANN Parameters
     parser.add_argument('--ann-exact-computation', type=str2bool, default='True',
@@ -101,11 +103,19 @@ def parse_args() -> argparse.Namespace:
         # Show me dump for sanity check
     else:
         print("\033[1;32mUsing default configuration\033[0m")
-    
 
     return args
 
-def extract_path(g: FbWikiGraph, x: str, y: str, args: argparse.Namespace, rels: Optional[list[str]] = None, non_inform: List[str] = []) -> List[Tuple[List[Any], List[Any]]]:
+
+def extract_path(
+    g: FbWikiGraph,
+    x: str,
+    y: str,
+    args: argparse.Namespace,
+    limit: int,
+    rels: Optional[list[str]] = None,
+    non_inform: List[str] = [],
+) -> List[Tuple[List[Any], List[Any]]]:
     """
     Extracts paths between two nodes in the graph.
 
@@ -126,7 +136,7 @@ def extract_path(g: FbWikiGraph, x: str, y: str, args: argparse.Namespace, rels:
                     max_hops=args.max_hops,
                     relationship_types=rels,
                     noninformative_types=non_inform,
-                    limit=None,
+                    limit=limit,
                     rdf_only=True,
                     can_cycle=False
                     )
@@ -144,7 +154,6 @@ if __name__ == '__main__':
     
     # Question, Embedding, and ANN models
     if args.max_relevant_relations is not None:
-
         embedding_gpt = OpenAIHandler(model=args.embedding_model, encoding=args.encoding_model)
         ann = FbWikiANN(
                 data_path = args.relation_data_path,
@@ -203,11 +212,12 @@ if __name__ == '__main__':
         paths = []
         # question nodes and answer node
         with ThreadPoolExecutor(max_workers=args.num_workers) as executor:  # Adjust max_workers based on your system
-            futures = [executor.submit(extract_path, g, q0, answers[0], args, p_ids, noninformative_pids) for q0 in q_ids]
+            futures = [executor.submit(extract_path, g, q0, answers[0], args, args.path_return_limit, p_ids, noninformative_pids) for q0 in q_ids]
             
             for i1, q0 in enumerate(q_ids):
                 for q1 in q_ids[i1+1:]:
-                    futures.append(executor.submit(extract_path, g, q0, q1, args, p_ids, noninformative_pids))
+                    print(f"Addings pids {p_ids}")
+                    futures.append(executor.submit(extract_path, g, q0, q1, args, args.path_return_limit, p_ids, noninformative_pids))
             
             # Process the completed futures as they finish
             for future in as_completed(futures):
