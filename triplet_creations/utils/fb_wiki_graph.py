@@ -27,6 +27,7 @@ from typing import Dict, List, Optional, Tuple
 
 
 from utils.basic import load_pandas
+from utils.common import Path
 
 #------------------------------------------------------------------------------
 'FB-Wiki Graph'
@@ -505,13 +506,13 @@ class FbWikiGraph():
         qid_end: str,
         min_hops: Optional[int] = 2,
         max_hops: Optional[int] = 3,
-        limit: int = 1,
+        limit: Optional[int] = 1,
         relationship_types: Optional[list[str]] = None,
         noninformative_types: List[str] = [],
         qid_only: bool = False,
         rand: bool = False,
         can_cycle: bool = True,
-    ) -> List[Tuple[List[any], List[any]]]:
+    ) -> list[Path]: 
         # TODO: Check and fix after the new update
         """
         Finds multiple paths between two nodes in the graph, filtering by hop count, relationship types, and other options.
@@ -561,7 +562,7 @@ class FbWikiGraph():
                 rand_part_a = "WITH path LIMIT 1000" if rand else ""
                 rand_part_b = "ORDER BY rand()" if rand else ""
                 
-                limit_part = f"LIMIT {limit}" if (type(limit) == int and limit > 0) else ""
+                limit_part = f"LIMIT {limit}" if (type(limit) is int and limit > 0) else ""
 
                 query = (
                     f"""

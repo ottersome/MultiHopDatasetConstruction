@@ -65,6 +65,8 @@ def parse_args() -> argparse.Namespace:
                         help='Maximum number of hops to consider in the path.')
     parser.add_argument('--num-workers', type=int, default=10,
                         help='Number of workers to use for path extractions.')
+    parser.add_argument('--path_return_limit', type=int, default=1,
+                        help='Maximum number of paths to return for each node pair.')
     
     # ANN Parameters
     parser.add_argument('--ann-exact-computation', type=str2bool, default='True',
@@ -101,7 +103,6 @@ def parse_args() -> argparse.Namespace:
         # Show me dump for sanity check
     else:
         print("\033[1;32mUsing default configuration\033[0m")
-    
 
     return args
 
@@ -117,7 +118,6 @@ if __name__ == '__main__':
     
     # Question, Embedding, and ANN models
     if args.max_relevant_relations is not None:
-
         embedding_gpt = OpenAIHandler(model=args.embedding_model, encoding=args.encoding_model)
         ann = FbWikiANN(
                 data_path = args.relation_data_path,
@@ -176,11 +176,12 @@ if __name__ == '__main__':
         paths = []
         # question nodes and answer node
         with ThreadPoolExecutor(max_workers=args.num_workers) as executor:  # Adjust max_workers based on your system
-            futures = [executor.submit(g.find_path, q0, answers[0], args.min_hops, args.max_hops, None, p_ids, noninformative_pids, True, False, False) for q0 in q_ids]
-
+            futures = [executor.submit(g.find_path, q0, answers[0], args.min_hops, args.max_hops, args.path_return_limit, p_ids, noninformative_pids, True, False, False) for q0 in q_ids]
+            
             for i1, q0 in enumerate(q_ids):
                 for q1 in q_ids[i1+1:]:
-                    futures.append(executor.submit(g.find_path, q0, q1, args.min_hops, args.max_hops, None, p_ids, noninformative_pids, True, False, False))
+                    print(f"Addings pids {p_ids}")
+                    futures.append(executor.submit(g.find_path, q0, q1, args.min_hops, args.max_hops, args.path_return_limit, p_ids, noninformative_pids, True, False, True))
             
             # Process the completed futures as they finish
             for future in as_completed(futures):
@@ -232,3 +233,4 @@ if args.verbose:
         print(f"{visual_path}")
     
     print('\n==================')
+    print(f"Jeopardy Questions with Paths: {sum(jeopardy_df['has_path'])}/{len(jeopardy_df)}")
