@@ -507,13 +507,13 @@ class FbWikiGraph():
         rdf_end: str,
         min_hops: Optional[int] = 2,
         max_hops: Optional[int] = 3,
-        limit: int = 1,
+        limit: Optional[int] = 1,
         relationship_types: Optional[list[str]] = None,
         noninformative_types: List[str] = [],
         rdf_only: bool = False,
         rand: bool = False,
         can_cycle: bool = True,
-    ) -> List[Tuple[List[any], List[any]]]:
+    ) -> list[Path]: 
         # TODO: Check and fix after the new update
         """
         Finds multiple paths between two nodes in the graph, filtering by hop count, relationship types, and other options.
