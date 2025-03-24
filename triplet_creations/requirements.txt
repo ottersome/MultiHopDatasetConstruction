@@ -1,1 +1,9 @@
-637519dde4bac80e6393f4cf17559c2b8e4928390c0007ee27df4b247948d9bb
+numpy>=1.19.0
+pandas>=1.0.0
+tqdm>=4.46.0
+requests>=2.24.0
+wikidata-client>=0.3.2
+bs4>=0.0.1
+beautifulsoup4>=4.9.1
+typing>=3.7.4
+argparse>=1.4.0

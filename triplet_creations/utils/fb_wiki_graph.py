@@ -30,6 +30,8 @@ from logging import getLogger
 
 from utils.basic import load_pandas
 
+Path = Tuple[List[any], List[any]]
+
 #------------------------------------------------------------------------------
 'FB-Wiki Graph'
 class FbWikiGraph():
@@ -563,7 +565,7 @@ class FbWikiGraph():
                 rand_part_a = "WITH path LIMIT 1000" if rand else ""
                 rand_part_b = "ORDER BY rand()" if rand else ""
                 
-                limit_part = f"LIMIT {limit}" if (type(limit) == int and limit > 0) else ""
+                limit_part = f"LIMIT {limit}" if (type(limit) is int and limit > 0) else ""
 
                 rand_int = random.randint(0, 1000)
                 query = (
