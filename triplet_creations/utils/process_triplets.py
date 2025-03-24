@@ -27,6 +27,9 @@ from typing import List, Tuple, Dict, Set, Union
 from utils.basic import load_triplets, load_to_dict, load_to_set
 from utils.basic import save_triplets, save_set_pandas, save_dict_pandas
 from utils.basic import sort_by_qid
+from utils.logging import create_logger
+
+logger = create_logger("process_triplets")
 
 #------------------------------------------------------------------------------
 """
@@ -251,7 +254,9 @@ def count_entity_occurance(file_path: Union[str, List[str]]) -> Tuple[pd.DataFra
     df = load_triplets(file_path)
 
     # Count the occurrences in the 'head' column
-    head_counts = df['head'].value_counts().reset_index()
+    head_counts = triplets_df['head'].value_counts().reset_index()
+    logger.debug(f"triplets_df: {triplets_df.head()}")
+    logger.debug(f"Head counts: {head_counts.head()}")
     head_counts.columns = ['entity', 'head_count']
 
     # Count the occurrences in the 'tail' column
@@ -346,6 +351,46 @@ def collect_entities_via_pruning(file_path: Union[str, List[str]], pruning_num: 
     entity_set = set(heads | set(filtered_counts['entity']))
 
     return entity_set
+
+def get_relations_and_entities_to_prune(
+    triplets_df: pd.DataFrame,
+    non_prunable_entities: Set[str],
+    non_prunable_relations: Set[str],
+    pruning_num: int,
+) -> Tuple[Set[str], Set[str]]:
+    """
+    Collects the entities with 0 head count and a tail count greater than or equal to a given threshold.
+    
+    Args:
+        triplets_df (pd.DataFrame): Triplets DataFrame
+        pruning_num (int): The minimum count across tails and heads to include an entity. Default is 10.
+            Also used for relations.
+    Returns:
+        Set[str]: A Set containing the ID of filtered entities.
+    """
+    entity_merged_counts, _, _ = count_entity_occurance(triplets_df)
+    relation_counts = count_relationship_occurance(triplets_df)
+
+    # Logger dump relations
+    logger.debug(f"Entity : \n{triplets_df.head()}")
+    logger.debug(f"Entity Counts: \n{entity_merged_counts.head()}")
+    logger.debug(f"Relation Counts: \n{relation_counts.head()}")
+
+    # Filter entities with 0 head count and tail count >= pruning_num
+    filtered_entity_counts = entity_merged_counts[
+        (entity_merged_counts["total_count"] <= pruning_num)
+    ]
+    filtered_relation_counts = relation_counts[
+        (relation_counts["count"] <= pruning_num)
+    ]
+
+    # Create the new entity list
+    entity_set =  set(filtered_entity_counts['entity'])
+    relation_set = set(filtered_relation_counts['relation'])
+    entity_set.update(non_prunable_entities)
+    relation_set.update(non_prunable_relations)
+
+    return entity_set, relation_set
 
 def find_missing_entities(before_path: str, after_path: str) -> set:
     """

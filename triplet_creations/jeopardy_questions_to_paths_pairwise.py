@@ -2,7 +2,7 @@ import argparse
 from tqdm import tqdm
 
 import numpy as np
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 
 from typing import List, Optional, Tuple, Any
 
@@ -11,7 +11,7 @@ from utils.basic import load_pandas, overload_parse_defaults_with_yaml
 from utils.basic import extract_literals, random_dataframes, str2bool
 from utils.verify_triplets import sort_path_by_node_match, filter_tuples_by_node, visualize_path
 from utils.openai_api import OpenAIHandler
-from utils.fb_wiki_graph import FbWikiGraph
+from utils.fb_wiki_graph import FbWikiGraph, Path
 from utils.fb_wiki_ann import FbWikiANN
 
 def parse_args() -> argparse.Namespace:
@@ -93,44 +93,96 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def extract_path(
+def find_paths_pairwise(
     g: FbWikiGraph,
-    x: str,
-    y: str,
-    min_hops: Optional[int] = 2,
-    max_hops: Optional[int] = 3,
-    limit: int,
-    rels: Optional[list[str]] = None,
-    non_inform: List[str] = [],
-) -> List[Tuple[List[Any], List[Any]]]:
+    nodes: list[str],
+    allowed_relTypes: list[str],
+    non_inform_relTypes: list[str],
+    timeout: Optional[int],
+    num_paths_return_limit: Optional[int],
+    max_hops: Optional[int],
+    min_hops: Optional[int],
+    num_workers: int,
+) -> list[Path]:
     """
-    Extracts paths between two nodes in the graph.
-
-    Args:
-        g (FbWikiGraph): The graph object.
-        x (str): The RDF identifier of the start node.
-        y (str): The RDF identifier of the end node.
-        args (argparse.Namespace): Parsed arguments.
-        rels (List[str], optional): List of relationship types to consider. Defaults to None.
-        non_inform (List[str], optional): List of non-informative relationships to filter out. Defaults to [].
-
-    Returns:
-        List[Tuple[List[Any], List[Any]]]: A list of paths between the nodes.
-    """
-    paths = g.find_path(x, y, 
-                    min_hops=args.min_hops,
-                    # max_hops=len(q_ids)+2,
-                    max_hops=args.max_hops,
-                    relationship_types=rels,
-                    noninformative_types=non_inform,
-                    limit=limit,
-                    rdf_only=True,
-                    can_cycle=False
-                    )
-    return paths
-
-if __name__ == '__main__':
+    Find paths connecting all nodes in a set where each node connects to at least one other.
     
+    Args:
+        g: Neo4j graph object
+        nodes: List of node IDs including question nodes and answer node
+        args: Arguments for path extraction
+        allowed_rel_types: Allowed relationship types
+        non_inform: Non-informative relationship types to filter out
+    Returns:
+        List of path tuples
+    """
+    
+    all_paths = []
+    connected_nodes = set()  # Nodes that already have at least one connection
+    unconnected_nodes = set(nodes)  # Nodes still needing a connection
+    
+    while unconnected_nodes:
+        # Take the first unconnected node
+        current_node = next(iter(unconnected_nodes))
+        
+        # Define potential target nodes (all nodes except self)
+        potential_targets = [n for n in nodes if n != current_node]
+        
+        # Find a path to ANY other node
+        found_path_inner = False
+        
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # Create futures for path searches
+            future_to_target = {}
+            for target in potential_targets:
+                future = executor.submit(
+        qid_start = 
+        qid_end = 
+        min_hops = 
+        max_hops = 
+        limit = 
+        relationship_types = 
+        noninformative_types = 
+        qid_only = 
+        rand = 
+        can_cycle = 
+
+                   current_node,
+                   target,
+                   min_hops,
+                   max_hops,
+                   num_paths_return_limit,
+                   allowed_relTypes,
+                   non_inform_relTypes,
+                )
+                future_to_target[future] = target
+            
+            # Process results as they complete with timeout
+            for future in as_completed(future_to_target):
+                target = future_to_target[future]
+                try:
+                    paths: list[Path] = future.result(timeout=timeout)
+                    if paths:
+                        all_paths.extend(paths[0]) # Just grab the first path. We dont care otherwise
+                        connected_nodes.add(current_node)
+                        connected_nodes.add(target)
+                        found_path_inner = True
+                        break
+                except TimeoutError:
+                    print(f"Path search from {current_node} to {target} timed out after {timeout}s")
+                    continue
+        
+        # Remove this node from unconnected, whether a path was found or not
+        unconnected_nodes.remove(current_node)
+        
+        # If no path found, we still mark it as processed but print a warning
+        if not found_path_inner:
+            # Unteneable question
+            return []
+    
+    return all_paths
+
+def main():
     args = parse_args()
     
     configs = global_configs(args.config_path)
@@ -191,28 +243,19 @@ if __name__ == '__main__':
         if ann is not None:
             embeddings = np.array(embedding_gpt.get_embedding(question))[None,:]
             _, indices = ann.search(embeddings, args.max_relevant_relations)
-            p_ids        = list(set(ann.index2data(indices, 'Property', max_indices=args.max_relevant_relations)[0]))
+            allowed_relTypes = list(set(ann.index2data(indices, 'Property', max_indices=args.max_relevant_relations)[0]))
         else:
-            p_ids = None
+            allowed_relTypes = None
 
-        
-        paths = []
+        paths = find_paths_pairwise(
+            g,
+            q_ids,
+            answers[0],
+            allowed_relTypes,
+            noninformative_pids,
+            timeout=args.path_search_timeout,
+        )
         # question nodes and answer node
-        with ThreadPoolExecutor(max_workers=args.num_workers) as executor:  # Adjust max_workers based on your system
-            futures = [executor.submit(extract_path, g, q0, answers[0], args, args.path_return_limit, p_ids, noninformative_pids) for q0 in q_ids]
-            
-            for i1, q0 in enumerate(q_ids):
-                for q1 in q_ids[i1+1:]:
-                    print(f"Addings pids {p_ids}")
-                    futures.append(executor.submit(extract_path, g, q0, q1, args, args.path_return_limit, p_ids, noninformative_pids))
-            
-            # Process the completed futures as they finish
-            for future in as_completed(futures):
-                path_sub = future.result()
-                
-                path_sub = filter_tuples_by_node(path_sub, answers[0]) # throw away paths that don't have the answer node
-                
-                if path_sub: paths += path_sub
             
         sorted_tuples, _, _ = sort_path_by_node_match(paths, q_ids)
         
@@ -233,6 +276,9 @@ if __name__ == '__main__':
             # Write all log outputs at the end of the iteration
             for line in log_output:
                 tqdm.write(line)
+
+if __name__ == '__main__':
+    main()
 
 
 if args.save_results:
