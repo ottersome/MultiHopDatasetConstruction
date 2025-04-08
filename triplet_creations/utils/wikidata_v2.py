@@ -28,7 +28,9 @@ from wikidata.client import Client
 
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
-from typing import List, Union
+from typing import DefaultDict, List, Union
+
+from wikidata.entity import EntityId
 
 from utils.basic import load_to_set, sort_by_qid, sort_qid_list
 
@@ -124,8 +126,17 @@ def process_entity_data(file_path: Union[str, List[str]], output_file_path: str,
     df.to_csv(output_file_path, index=False)
     print("\nData processed and saved to", output_file_path)
 
-def process_entity_triplets(file_path: Union[str, List[str]], output_file_path: str, nrows: int = None, max_workers: int = 10,
-                            max_retries: int = 3, timeout: int = 2, verbose: bool = False, failed_log_path: str = './data/failed_ent_log.txt') -> None:
+
+def process_entity_triplets(
+    file_path: Union[str, List[str]],
+    output_file_path: str,
+    nrows: int = None,
+    max_workers: int = 10,
+    max_retries: int = 3,
+    timeout: int = 2,
+    verbose: bool = False,
+    failed_log_path: str = "./data/failed_ent_log.txt",
+) -> None:
     """
     Scrapes and processes triplet relationships for a set of entities from Wikidata and saves the data to a TXT file.
 
@@ -256,41 +267,63 @@ def fetch_freebase_id(soup: BeautifulSoup) -> str:
     except Exception as e:
         return ''
 
-def fetch_entity_triplet(rdf: str, client: Client) -> List[List[str]]:
+def fetch_entity_triplet(
+    rdf: str, client: Client, mode: str = "expanded"
+) -> tuple[set[tuple[str, str, str]], dict[tuple[str,str,str],list[str]]]:
     """
     Retrieves the triplet relationships an entity has on Wikidata.
 
     Args:
         rdf (str): The RDF identifier of the entity.
         client (Client): Wikidata client for API requests.
+        mode (str): Mode of processing triplets. Options are 'expanded', 'separate', 'ignore'.
 
     Returns:
         List[List[str]]: A list of triplets (head, relation, tail) related to the entity.
     """
     
+    assert mode in ["expanded", "separate", "ignore"], "Invalid mode for fetch_entity_triplet."
     if not rdf and 'Q' != rdf[0]: return []
     
-    entity = client.get(rdf, load=True)
+    entity = client.get(EntityId(rdf), load=True)
     
-    triplets = []
-    ent_data = entity.data['claims']
-    for e0 in ent_data:
-        for e1 in ent_data[e0]:
-            if ('datavalue' in set(e1['mainsnak'].keys()) 
-                and type(e1['mainsnak']['datavalue']['value']) != str
-                and 'id' in set(e1['mainsnak']['datavalue']['value'].keys())
-                and 'Q' == e1['mainsnak']['datavalue']['value']['id'][0]):
-                triplets.append([entity.id, e0, e1['mainsnak']['datavalue']['value']['id']])
+    triplets: set[tuple[str, str, str]] = set()
+    qualifier_triplets = DefaultDict(list)
+    ent_data = entity.data
+    if ent_data is None:
+        raise ValueError(f"Entity {rdf} not found in Wikidata.")
+    ent_claims = ent_data["claims"]
+    if not isinstance(ent_claims, dict):
+        raise ValueError(f"Entity {rdf} is not the expected type (dict).")
+
+    for relation in ent_claims.keys():
+        for statement in ent_claims[relation]:
+            if ('datavalue' in set(statement['mainsnak'].keys()) 
+                and type(statement['mainsnak']['datavalue']['value']) != str
+                and 'id' in set(statement['mainsnak']['datavalue']['value'].keys())
+                and 'Q' == statement['mainsnak']['datavalue']['value']['id'][0]):
+
+                triplet = (entity.id, relation, statement['mainsnak']['datavalue']['value']['id'])
+
+                if not all([isinstance(elem, str) for elem in triplet]):
+                    raise ValueError(f"An Element in triplet {triplet} is not a string")
+
+                triplets.add(triplet)
                 
-            if ('qualifiers' in set(e1.keys())):
-                for e2 in e1['qualifiers']:
-                    for e3 in e1['qualifiers'][e2]:
-                        if ('datavalue' in set(e3.keys())
-                            and type(e3['datavalue']['value']) != str
-                            and 'id' in set(e3['datavalue']['value'].keys())
-                            and 'Q' == e3['datavalue']['value']['id'][0]):
-                            triplets.append([entity.id, e2, e3['datavalue']['value']['id']])
-    return triplets
+                if mode != 'ignore' and ('qualifiers' in set(statement.keys())):
+                    for qual_relation in statement['qualifiers']:
+                        for qual_tail in statement['qualifiers'][qual_relation]:
+                            if ('datavalue' in set(qual_tail.keys())
+                                and type(qual_tail['datavalue']['value']) != str
+                                and 'id' in set(qual_tail['datavalue']['value'].keys())
+                                and 'Q' == qual_tail['datavalue']['value']['id'][0]):
+                                # Legacy behavior. Perhaps incorrect.
+                                if mode == 'expanded':
+                                    triplets.add((entity.id, qual_relation, qual_tail['datavalue']['value']['id']))
+                                elif mode == 'separate':
+                                    qualifier_triplets[triplet].append([qual_relation, qual_tail['datavalue']['value']['id']])
+    
+    return triplets, qualifier_triplets
     
 #------------------------------------------------------------------------------
 'Webscrapping for Relationship Info'
