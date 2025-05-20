@@ -249,8 +249,31 @@ def save_entity_expansion_checkpoint(
     # Saving Data
     with open(path_entities_yet_to_process, "w") as f:
         f.write("\n".join(entities_yet_to_process))
-    pd.DataFrame(triplets_processed, columns=ETWoQ_COLUMNS).to_csv(
-        path_triplets_proceessed_so_far, index=False
+    
+    # Create DataFrames
+    triplets_df = pd.DataFrame(triplets_processed, columns=ETWoQ_COLUMNS)
+    qualifier_df = pd.DataFrame({
+        QUALIFER_DICT_COLUMNS[0]: list(qualifier_dictionary.keys()),
+        QUALIFER_DICT_COLUMNS[1]: list(qualifier_dictionary.values()),
+    })
+    
+    # Check if files exist to determine whether to write headers
+    file_exists_triplets = os.path.exists(path_triplets_proceessed_so_far)
+    file_exists_qualifiers = os.path.exists(path_qualifier_dictionary)
+    
+    # Append to existing files or create new ones
+    triplets_df.to_csv(
+        path_triplets_proceessed_so_far, 
+        mode='a' if file_exists_triplets else 'w',
+        header=not file_exists_triplets,
+        index=False
+    )
+    
+    qualifier_df.to_csv(
+        path_qualifier_dictionary, 
+        mode='a' if file_exists_qualifiers else 'w',
+        header=not file_exists_qualifiers,
+        index=False
     )
     pd.DataFrame(
         {
