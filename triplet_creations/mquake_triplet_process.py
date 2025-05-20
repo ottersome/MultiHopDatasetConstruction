@@ -264,7 +264,7 @@ def expand_triplet_set(
     entity_set: Set[str],
     target_size: int,
     expansion_hops: int,
-    use_qualifiers_for_expansion: bool,
+    fetch_tail_triplets_for_n_hops: int,
     batch_size: int,
     max_workers: int, 
     max_retries: int,
@@ -321,12 +321,14 @@ def expand_triplet_set(
 
             logger.debug(f"About to go into batch at batch_start={batch_start}")
             logger.debug(f"Batch looks like: {batch}")
+            fetch_qid_as_tail = True if hop + 1 <= fetch_tail_triplets_for_n_hops
             _expanded_triplets, _forward_dict, _qualifier_dictionary = _batch_entity_set_expansion(
                 batch = batch,
                 max_workers = max_workers,
                 max_retries = max_retries,
                 timeout = timeout,
-                use_qualifiers_for_expansion=use_qualifiers_for_expansion,
+                # use_qualifiers_for_expansion=use_qualifiers_for_expansion,
+                fetch_tail_triplets=fetch_qid_as_tail,
             )
             logger.debug(f"At {batch_num} we have process {len(_expanded_triplets)} triplets")
             num_ogEntities_processed += batch_size
@@ -536,7 +538,7 @@ def expand_triplets_logistics(
     checkpointing_triplet_expansion_path: str,
     target_entity_count: int,
     expansion_hops: int,
-    use_qualifiers_for_expansion: bool,
+    fetch_tail_triplets_for_n_hops: int,
     entity_batch_size: int,
     max_workers: int,
     max_retries: int,
@@ -593,7 +595,7 @@ def expand_triplets_logistics(
         entity_set=entities_to_expand_upon,
         target_size=target_entity_count,
         expansion_hops=expansion_hops,
-        use_qualifiers_for_expansion=use_qualifiers_for_expansion,
+        fetch_tail_triplets_for_n_hops=fetch_tail_triplets_for_n_hops,
         batch_size=entity_batch_size,
         max_workers=max_workers,
         max_retries=max_retries,
@@ -695,7 +697,7 @@ def main():
 
     if args.mode in ['expand_entities', 'full_pipeline']:
         # Load MQuAKE entities if not already extracted in this run
-        expand_triplets_logistics(
+        nhop_expand_triplets_logistics(
             path_og_entities = args.og_entity_output,
             path_expanded_entities= args.outPath_expanded_entity_set, 
             path_triplets_w_qualifier = args.outPath_expanded_triplets,
@@ -703,7 +705,7 @@ def main():
             checkpointing_triplet_expansion_path = args.checkpointing_triplet_expansion_path,
             target_entity_count = args.target_entity_count,
             expansion_hops = args.expansion_hops,
-            use_qualifiers_for_expansion = args.use_qualifiers_for_expansion,
+            fetch_tail_triplets_for_n_hops = args.fetch_tail_triplets_for_n_hops, 
             entity_batch_size = args.entity_batch_size,
             max_workers = args.max_workers,
             max_retries = args.max_retries,
