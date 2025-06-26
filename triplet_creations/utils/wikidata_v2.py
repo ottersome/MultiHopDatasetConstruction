@@ -19,6 +19,9 @@ Core functionalities:
 
 import math
 import pandas as pd
+import random
+import re
+from utils.meta import deprecated
 
 import time
 import requests
