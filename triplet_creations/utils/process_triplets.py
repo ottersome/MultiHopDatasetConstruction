@@ -349,7 +349,7 @@ def get_relations_and_entities_to_prune(
     triplets_df: pd.DataFrame,
     non_prunable_entities: Set[str],
     non_prunable_relations: Set[str],
-    pruning_num: int,
+    pruning_upper_thresh: int,
 ) -> Tuple[Set[str], Set[str]]:
     """
     Collects the entities with 0 head count and a tail count greater than or equal to a given threshold.
@@ -359,10 +359,35 @@ def get_relations_and_entities_to_prune(
         pruning_num (int): The minimum count across tails and heads to include an entity. Default is 10.
             Also used for relations.
     Returns:
-        Set[str]: A Set containing the ID of filtered entities.
+        entities_to_rm: Set[str]: A Set containing the ID of the entities to remove. 
+        relations_to_remove
     """
     entity_merged_counts, _, _ = count_entity_occurance(triplets_df)
     relation_counts = count_relationship_occurance(triplets_df)
+
+    # Placeholder: Create a join to get exclusively the count of non_prunable_relations and non_prunable_entities
+    og_entity_counts = entity_merged_counts[entity_merged_counts['entity'].isin(non_prunable_entities)]
+    og_relation_counts = relation_counts[relation_counts['relation'].isin(non_prunable_relations)]
+    og_ents_below_threshold = og_entity_counts[og_entity_counts['total_count'] <= pruning_upper_thresh].sort_values(by=['total_count'], ascending=[False])
+    og_rels_below_threshold = og_relation_counts[og_relation_counts['count'] <= pruning_upper_thresh].sort_values(by=['count'], ascending=[False])
+    if len(og_ents_below_threshold) > 0:
+        logger.warning(f"⚠️  There are {len(og_ents_below_threshold)} entities below the threshold")
+        logger.debug(f"Their IDs are: {og_ents_below_threshold['entity'].tolist()}")
+        # Dump them into `./debug`
+        og_ents_below_threshold.to_csv("./debug/entities_below_threshold.csv", index=False)
+    if len(og_rels_below_threshold) > 0:
+        logger.warning(f"⚠️  There are {len(og_rels_below_threshold)} relations below the threshold")
+        logger.debug(f"Their IDs are: {og_rels_below_threshold['relation'].tolist()}")
+        # Dump them into `./debug`
+        og_rels_below_threshold.to_csv("./debug/relations_below_threshold.csv", index=False)
+
+    # Reorder columns based on on total_count and count
+    entity_merged_counts = entity_merged_counts.sort_values(by=['total_count'], ascending=[False])
+    relation_counts = relation_counts.sort_values(by=['count'], ascending=[False])
+
+    # TOREM: Only keep for debugging 
+    entity_merged_counts.to_csv("entity_merged_counts.csv")
+    relation_counts.to_csv("relation_counts.csv")
 
     # Logger dump relations
     logger.debug(f"Entity : \n{triplets_df.head()}")
@@ -371,19 +396,19 @@ def get_relations_and_entities_to_prune(
 
     # Filter entities with 0 head count and tail count >= pruning_num
     filtered_entity_counts = entity_merged_counts[
-        (entity_merged_counts["total_count"] <= pruning_num)
+        (entity_merged_counts["total_count"] <= pruning_upper_thresh)
     ]
     filtered_relation_counts = relation_counts[
-        (relation_counts["count"] <= pruning_num)
+        (relation_counts["count"] <= pruning_upper_thresh)
     ]
 
     # Create the new entity list
-    entity_set =  set(filtered_entity_counts['entity'])
-    relation_set = set(filtered_relation_counts['relation'])
-    entity_set.update(non_prunable_entities)
-    relation_set.update(non_prunable_relations)
+    entities_to_rm =  set(filtered_entity_counts['entity'])
+    relations_to_rm = set(filtered_relation_counts['relation'])
+    entities_to_rm = entities_to_rm - non_prunable_entities
+    relations_to_rm = relations_to_rm - non_prunable_relations
 
-    return entity_set, relation_set
+    return entities_to_rm, relations_to_rm
 
 def find_missing_entities(before_path: str, after_path: str) -> set:
     """
