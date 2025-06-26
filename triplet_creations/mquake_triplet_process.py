@@ -25,18 +25,31 @@ Usage:
     python mquake_triplet_process.py --mode create_dataset --triplet_file [path_to_raw_triplets]
     python mquake_triplet_process.py --mode full_pipeline --mquake_path [path_to_mquake]
     python mquake_triplet_process.py --mode convert_triplets_for_stats --mquake_path [path_to_mquake]
+
+TODOs
+-----
+
+- [ ] We have to ensure that the og_entities and og_relations have some threshold in the dataset. 
+  We dont want them poorly represented in the final dataset afterall
+
 """
 
 import argparse
 import ast
+from hmac import new
+from math import exp
+from multiprocessing import process
+import json
 import os
 import random
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tabnanny import check
+import time
 from typing import Any, Dict, List, Set, Tuple
 from xxlimited import Str
 
+from debugpy.common.timestamp import current
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -46,7 +59,7 @@ import debugpy
 from utils.common import StrTriplet
 from utils.logging import create_logger
 from utils.process_triplets import get_relations_and_entities_to_prune
-from utils.wikidata_v2 import fetch_entity_triplet, process_entity_triplets, retry_fetch
+from utils.wikidata_v2 import fetch_entity_triplet_bidirectional, fetch_entity_triplet_for_head, process_entity_triplets, retry_fetch
 from utils.mquake import extract_mquake_entities
 
 
@@ -56,6 +69,7 @@ QUALIFER_DICT_COLUMNS = ["triplet", "qualifier"]
 CHECKPOINT_ENTITIES_FILENAME = "entities_yet_to_process.txt"
 CHECKPOINT_TRIPLETS_FILENAME = "triplets_proceessed_so_far.csv"
 CHECKPOINT_QUALIFIERS_FILENAME = "qualifiers.csv"
+CHECKPOINT_METADATA_FILENAME = "metadata.json"
 
 
 def parse_args():
@@ -84,9 +98,9 @@ def parse_args():
                         help="Path to save the extracted entities from counterfactual set")
     parser.add_argument("--rr_relation_output", type=str, default="./data/mquake/rr_relations.txt",
                         help="Path to save the extracted relations from counterfactual set")
-    parser.add_argument("--expandedNpruned_entity_output", type=str, default="./data/mquake/expandedNpruned_relations.txt",
+    parser.add_argument("--outPath_expNPruned_ents", type=str, default="./data/mquake/expandedNpruned_entities.txt",
                         help="Path to save the expanded and pruned entities from counterfactual set")
-    parser.add_argument("--expandedNpruned_relation_output", type=str, default="./data/mquake/expandedNpruned_relations.txt",
+    parser.add_argument("--outPath_expNPruned_rels", type=str, default="./data/mquake/expandedNpruned_relations.txt",
                         help="Path to save the expanded and pruned relations from counterfactual set")
     ## Helper data
     parser.add_argument("--relationship_hierarchy_mapping_path", type=str, default="./data/relationships_hierarchy.txt",
@@ -103,6 +117,7 @@ def parse_args():
                         help="Path to save the expanded relation set")
 
     # Triplet processing parameters
+    parser.add_argument("--fetch_tail_triplets_for_n_hops", default=1, type=int, help="How many hops to get tail triplets for. Remember that each hop will be increasingly bigger and this operation is terribly expensive")
     parser.add_argument("--raw_triplet_output", type=str, default="./data/mquake/raw_triplets.txt",
                         help="Path to save raw triplets from WikiData querying")
     parser.add_argument("--processed_triplet_output", type=str, default="./data/mquake/processed_triplets.txt",
@@ -117,15 +132,15 @@ def parse_args():
     )
 
     # Dataset creation parameters
-    parser.add_argument("--train_output", type=str, default="./data/mquake/train.txt",
+    parser.add_argument("--outPath_train_split", type=str, default="./data/mquake/train.txt",
                         help="Path to save the training triplets")
-    parser.add_argument("--test_output", type=str, default="./data/mquake/test.txt",
+    parser.add_argument("--outPath_test_split", type=str, default="./data/mquake/test.txt",
                         help="Path to save the test triplets")
-    parser.add_argument("--valid_output", type=str, default="./data/mquake/valid.txt",
+    parser.add_argument("--outPath_valid_split", type=str, default="./data/mquake/valid.txt",
                         help="Path to save the validation triplets")
 
     # Entity expansion parameters
-    parser.add_argument("--expansion_hops", type=int, default=1,
+    parser.add_argument("--expansion_hops", type=int, default=2,
                         help="Number of hops to expand from core entities")
     parser.add_argument("--target_entity_count", type=int, default=15000,
                         help="Target number of entities to include in the dataset")
@@ -134,13 +149,14 @@ def parse_args():
     parser.add_argument("--use_qualifiers_for_expansion", action="store_true", help="Whether to use qualifiers for entity expansion")
 
     # Filtering 
-    parser.add_argument("--ent_rel_pruning_threshold", type=int, default=10,
+    parser.add_argument("--ent_rel_pruning_threshold", type=int, default=40,
         help="Number of appearances in triplets necessary for an entity and realtions to appear.")
-    parser.add_argument( "--pruned_triplets_output", default="./data/mquake/pruned_triplets.txt",
+    parser.add_argument( "--outPath_expNPruned_triplets", default="./data/mquake/expNpruned_triplets.txt",
         type=str, help="Location to save pruned triplets to to",)
+    parser.add_argument("--ignore_nonprunables", action="store_true", help="Wheter to simply ignore non prunables and just prune them out.")
 
     # Triplet generation parameters
-    parser.add_argument("--max_workers", type=int, default=20,
+    parser.add_argument("--max_workers", type=int, default=5,
                         help="Maximum number of concurrent workers for WikiData API queries")
     parser.add_argument("--max_retries", type=int, default=3,
                         help="Maximum number of retries for failed WikiData queries")
@@ -171,14 +187,15 @@ def _batch_entity_set_expansion(
     max_workers: int,
     max_retries: int,
     timeout: int,
-    use_qualifiers_for_expansion: bool,
+    fetch_tail_triplets: bool, 
 ) -> Tuple[Set[StrTriplet], Dict[str,str],Dict]:
     """
     Batch-wise entity expansion
 
-    Returns (2)
+    Returns (3)
     ---------
     - newfound_triplets: Set of new triplets
+    - forward_dict: Dictionary detailing updates in id as dicated by wikidata
     - qualifier_dictionary: Dictionary of qualifier triplets
     """
 
@@ -189,14 +206,17 @@ def _batch_entity_set_expansion(
     logger.debug("Before entering future creationon context.")
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
 
+        function_to_run = fetch_entity_triplet_bidirectional if fetch_tail_triplets else fetch_entity_triplet_for_head 
+        logger.debug(f"Will be doing fetching in {'bidirectional' if fetch_tail_triplets else 'non-bidirectional'} approach")
+
         # Submit tasks to fetch neighbors for each entity in the batch
         logger.debug("About to create futures")
         futures = {
             executor.submit(
                 retry_fetch,
-                fetch_entity_triplet,
+                function_to_run,
                 entity,
-                "expanded" if use_qualifiers_for_expansion else "separate",
+                "ignore",
                 max_retries=max_retries,
                 timeout=timeout,
                 verbose=True,
@@ -205,7 +225,6 @@ def _batch_entity_set_expansion(
         }
         
         # Process results as they complete
-        logger.debug("About to hang for futures")
         for future in as_completed(futures):
             entity = futures[future]
             try:
@@ -228,8 +247,10 @@ def save_entity_expansion_checkpoint(
     triplets_processed: Set[StrTriplet],
     qualifier_dictionary: Dict[str, str],
     save_directory: str,
+    current_hop: int,
 ) -> None:
-    logger.info(f"Saving Checkpoint to {save_directory}")
+    time_start = time.time()
+    logger.debug(f"Saving Checkpoint to {save_directory}")
     # Prepping paths
     path_entities_yet_to_process = os.path.join(
         save_directory, CHECKPOINT_ENTITIES_FILENAME
@@ -239,6 +260,9 @@ def save_entity_expansion_checkpoint(
     )
     path_qualifier_dictionary = os.path.join(
         save_directory, CHECKPOINT_QUALIFIERS_FILENAME
+    )
+    path_metadata_dictionary = os.path.join(
+        save_directory, CHECKPOINT_METADATA_FILENAME
     )
 
     logger.debug(f"Storing {len(entities_yet_to_process)} entities_yet_to_process into {path_entities_yet_to_process}")
@@ -275,17 +299,21 @@ def save_entity_expansion_checkpoint(
         header=not file_exists_qualifiers,
         index=False
     )
-    pd.DataFrame(
-        {
-            QUALIFER_DICT_COLUMNS[0]: list(qualifier_dictionary.keys()),
-            QUALIFER_DICT_COLUMNS[1]: list(qualifier_dictionary.values()),
-        }
-    ).to_csv(path_qualifier_dictionary, index=False)
 
+    # Save metadata
+    metadata: Dict[str, Any] = {}
+    metadata["current_hop"] = current_hop
+    with open(path_metadata_dictionary, 'w') as f:
+        json.dump(metadata, f)
+
+
+    time_to_save = time.time() - time_start
+    logger.debug(f"Finished saving data to cache. Took {time_to_save} seconds")
 
 def expand_triplet_set(
     entity_set: Set[str],
     target_size: int,
+    initial_hop: int,
     expansion_hops: int,
     fetch_tail_triplets_for_n_hops: int,
     batch_size: int,
@@ -322,9 +350,9 @@ def expand_triplet_set(
     num_ogEntities_processed = 0
     
     # Process in hops
-    for hop in range(expansion_hops):
+    for initial_hop in range(initial_hop,expansion_hops):
             
-        logger.info(f"Beginning hop {hop+1} with {len(entities_to_process_per_hop)} entities to process")
+        logger.info(f"Beginning hop {initial_hop+1} with {len(entities_to_process_per_hop)} entities to process")
         
         # Track neighbors found in this hop
         new_neighbors = set()
@@ -344,7 +372,7 @@ def expand_triplet_set(
 
             logger.debug(f"About to go into batch at batch_start={batch_start}")
             logger.debug(f"Batch looks like: {batch}")
-            fetch_qid_as_tail = True if hop + 1 <= fetch_tail_triplets_for_n_hops
+            fetch_qid_as_tail = True if initial_hop + 1 <= fetch_tail_triplets_for_n_hops else False
             _expanded_triplets, _forward_dict, _qualifier_dictionary = _batch_entity_set_expansion(
                 batch = batch,
                 max_workers = max_workers,
@@ -368,8 +396,14 @@ def expand_triplet_set(
             new_neighbors.update(new_tails)
 
             entities_yet_to_process = (set(entities_to_process_per_hop) | new_neighbors) - processed_entities
-            save_entity_expansion_checkpoint(entities_yet_to_process, expanded_triplets, qualifier_dictionary, checkpointing_path)
-        
+            save_entity_expansion_checkpoint(
+                entities_yet_to_process,
+                _expanded_triplets,
+                _qualifier_dictionary,
+                checkpointing_path,
+                initial_hop,
+            )
+
         # If no new neighbors were found, we can't expand further
         if not new_neighbors:
             logger.info("No new neighbors found, stopping expansion")
@@ -377,7 +411,7 @@ def expand_triplet_set(
             
         # Prepare for next hop if needed
         entities_to_process_per_hop = list(new_neighbors - processed_entities)
-        logger.info(f"Hop {hop+1} complete. Found {len(new_neighbors)} new neighbors.")
+        logger.info(f"Hop {initial_hop+1} complete. Found {len(new_neighbors)} new neighbors.")
         logger.info(f"Total entities now: {len(expanded_triplets)}")
     
     logger.info(f"Entity expansion complete. Final count: {len(expanded_triplets)}")
@@ -541,7 +575,7 @@ def create_dataset_splits(
         for head, rel, tail in valid_triplets:
             f.write(f"{head} {rel} {tail}\n")
 
-    logger.info(f"Dataset split complete:")
+    logger.info("Dataset split complete:")
     logger.info(f"- Training: {len(train_triplets)} triplets ({len(train_triplets)/total_triplets*100:.1f}%)")
     logger.info(f"- Testing: {len(test_triplets)} triplets ({len(test_triplets)/total_triplets*100:.1f}%)")
     logger.info(f"- Validation: {len(valid_triplets)} triplets ({len(valid_triplets)/total_triplets*100:.1f}%)")
@@ -553,7 +587,7 @@ def filtering_triplets():
     """
     pass
 
-def expand_triplets_logistics(
+def nhop_expand_triplets_logistics(
     path_og_entities: str,
     path_triplets_w_qualifier: str,
     path_expanded_entities: str,
@@ -573,9 +607,10 @@ def expand_triplets_logistics(
         entities_to_expand_upon = {line.strip() for line in f}
 
     entity_expansion_checkpointing_paths = {
-        "chckpnt_enitity_path" : os.path.join(checkpointing_triplet_expansion_path, CHECKPOINT_ENTITIES_FILENAME),
+        "chckpnt_entity_path" : os.path.join(checkpointing_triplet_expansion_path, CHECKPOINT_ENTITIES_FILENAME),
         "chckpnt_triplet_path" : os.path.join(checkpointing_triplet_expansion_path, CHECKPOINT_TRIPLETS_FILENAME),
         "chckpnt_qualifier_path" : os.path.join(checkpointing_triplet_expansion_path, CHECKPOINT_QUALIFIERS_FILENAME),
+        "chckpnt_metadata_path" : os.path.join(checkpointing_triplet_expansion_path, CHECKPOINT_METADATA_FILENAME),
     }
 
     logger.info(f"Expanding the original entity set from {len(entities_to_expand_upon)} initial entities...")
@@ -584,14 +619,14 @@ def expand_triplets_logistics(
     will_use_checkpoint = False
 
     if all_checkpoint_files_exist:
-        will_use_checkpoint = input(f"Do you want to continue from the checkpoint at {checkpointing_triplet_expansion_path}? (y/n)").lower() == "y"
+        will_use_checkpoint = input(f"Do you want to continue from the checkpoint at {checkpointing_triplet_expansion_path}? (y/n): ").lower() == "y"
     elif some_checkpoint_files_exist:
         raise RuntimeError("Not all checkpointing files were found.\n"
                            "Please make sure that all files are present and run the script again."
                            )
 
     if will_use_checkpoint:
-        with open(entity_expansion_checkpointing_paths["chckpnt_enitity_path"], 'r') as f:
+        with open(entity_expansion_checkpointing_paths["chckpnt_entity_path"], 'r') as f:
             entities_to_expand_upon = set(f.read().splitlines())
         _chkpntd_triplets_processed = pd.read_csv(entity_expansion_checkpointing_paths["chckpnt_triplet_path"], header=0)
         chkpntd_triplets_processed = [(row[0], row[1], row[2]) for row in _chkpntd_triplets_processed.values]
@@ -602,13 +637,22 @@ def expand_triplets_logistics(
         _chkpntd_qualifier_dictionary = _chkpntd_qualifier_dictionary.values.tolist()
         chkpntd_qualifier_dictionary = {ast.literal_eval(row[0]): ast.literal_eval(row[1]) for row in _chkpntd_qualifier_dictionary}
         logger.info(f"Continuing with the checkpoint files found at {os.path.basename(checkpointing_triplet_expansion_path)}")
+        logger.info("Checkpoint contains:\n"
+                    f"\t- {len(chkpntd_triplets_processed)} stored triplets\n"
+                    f"\t- {len(chkpntd_qualifier_dictionary)} stored qualifiers\n"
+                    f"\t- {len(entities_to_expand_upon)} stored entities to expand upon."
+                   )
+        # Load Metadata
+        with open(entity_expansion_checkpointing_paths["chckpnt_metadata_path"], 'r') as f:
+            metadata = json.load(f)
+            current_hop = metadata["current_hop"]
+            logger.info(f"Continuing from the checkpoint at hop {current_hop}")
     else:
         logger.info(f"Starting from the beginning with {len(entities_to_expand_upon)} entities")
-        # _chkpntd_triplets_processed = pd.DataFrame(columns=ETWoQ_COLUMNS)
         chkpntd_triplets_processed: List[StrTriplet] = []
-
-        # chkpntd_qualifier_dictionary = pd.DataFrame(columns=QUALIFER_DICT_COLUMNS)
         chkpntd_qualifier_dictionary: Dict[Tuple, List] = {}
+        current_hop = 0
+
 
         
     ########################################
@@ -617,6 +661,7 @@ def expand_triplets_logistics(
     expanded_triplets, qualifier_dict = expand_triplet_set(
         entity_set=entities_to_expand_upon,
         target_size=target_entity_count,
+        initial_hop = current_hop,
         expansion_hops=expansion_hops,
         fetch_tail_triplets_for_n_hops=fetch_tail_triplets_for_n_hops,
         batch_size=entity_batch_size,
@@ -628,10 +673,9 @@ def expand_triplets_logistics(
 
     expanded_triplets.update(chkpntd_triplets_processed)
     qualifier_dict.update(chkpntd_qualifier_dictionary)
-    
-    # TODO: Move saving responsability to parent script, not to isolated, reusable, function
+   
     ########################################
-    # Final Save of Data 
+   # Final Save of Data 
     ########################################
     expanded_triplets_w_qualifiers = []
     expanded_entities = set()
@@ -646,6 +690,7 @@ def expand_triplets_logistics(
         expanded_entities.update((new_triplet[0], new_triplet[2]))
         expanded_relations.add(new_triplet[1])
 
+    # TODO: Move responsability of saving to disk to parent script, not to isolated, reusable, function
     expanded_triplets_w_qualifiers_df = pd.DataFrame(expanded_triplets_w_qualifiers, columns=ETWQ_COLUMNS) # type: ignore
     expanded_triplets_w_qualifiers_df.to_csv(path_triplets_w_qualifier, index=False)
     logger.info(f"Saved {len(expanded_triplets)} expanded triplets to {path_triplets_w_qualifier}")
@@ -683,9 +728,9 @@ def main():
         args.outPath_expanded_triplets,
         args.raw_triplet_output,
         args.processed_triplet_output,
-        args.train_output,
-        args.test_output,
-        args.valid_output,
+        args.outPath_train_split,
+        args.outPath_test_split,
+        args.outPath_valid_split,
         args.checkpointing_triplet_expansion_path
     ]
 
@@ -738,7 +783,7 @@ def main():
     ########################################
     # Post Processing Modes; Mostly for utility:
     ########################################
-    if args.mode in ["convert_triplets_for_stats"]:
+    if args.mode in ["convert_triplets_for_stats", "full_pipeline"]:
         # Helpfpul for converting the triplets to a format for statistics
         expanded_triplets_w_qualifiers_df = pd.read_csv(
             args.outPath_expanded_triplets,
@@ -758,40 +803,53 @@ def main():
                 non_prunable_entities.add(line.strip())
         with open(args.og_relation_output, 'r') as f:
             for line in f:
-                print(f"NOn prunable relation {line.strip()}")
                 non_prunable_relations.add(line.strip())
         logger.info(f"Loaded {len(non_prunable_entities)} non prunable entities and"
                     f"Loaded {len(non_prunable_relations)} non prunable relations")
 
         # Load the expanded triplets
+        logger.info(f"Loading expanded triplets from {args.outPath_expanded_triplet_wo_qualifiers}")
         expanded_triplets_df = pd.read_csv(args.outPath_expanded_triplet_wo_qualifiers, sep="\t", header=None, names=["head", "relation", "tail"])
-        logger.info(f"Expanded triplest: {expanded_triplets_df.head()}")
+        logger.info(f"Expanded (of length: {len(expanded_triplets_df)} triplets: {expanded_triplets_df.head()}")
 
         # Prune the triplets
-        ent_to_prune, rel_to_prune = get_relations_and_entities_to_prune(
+        ents_to_prune, rels_to_prune = get_relations_and_entities_to_prune(
             triplets_df=expanded_triplets_df,
             non_prunable_entities=set(non_prunable_entities),
             non_prunable_relations=set(non_prunable_relations),
-            pruning_num=args.ent_rel_pruning_threshold,
+            pruning_upper_thresh=args.ent_rel_pruning_threshold,
         )
-        logger.info(f"About to prune {len(ent_to_prune)} entities and {len(rel_to_prune)} relations")
+        logger.info(f"About to prune {len(ents_to_prune)} entities and {len(rels_to_prune)} relations")
 
         # Filter out pruned entities and relations
+        logger.info(f"expanded_triplets_df now contains {len(expanded_triplets_df)} triplets")
         pruned_triplets_df = expanded_triplets_df[
-            ~expanded_triplets_df['head'].isin(ent_to_prune) &
-            ~expanded_triplets_df['tail'].isin(ent_to_prune) &
-            ~expanded_triplets_df['relation'].isin(rel_to_prune)
+            ~expanded_triplets_df['head'].isin(ents_to_prune) &
+            ~expanded_triplets_df['tail'].isin(ents_to_prune) &
+            ~expanded_triplets_df['relation'].isin(rels_to_prune)
         ]
+        logger.info(f"{len(pruned_triplets_df)} triplets remain after pruning")
 
-        pruned_triplets_df.to_csv(args.pruned_triplets_output, index=False, sep="\t")
+        # Calculate new Entity and Relation Set
+        ent_set = pd.concat([pruned_triplets_df['head'], pruned_triplets_df['tail']]).drop_duplicates()
+        rel_set = pruned_triplets_df['relation'].drop_duplicates()
 
+        # Save the new Entity and Relation Set
+        ent_set.to_csv(args.outPath_expNPruned_ents, index=False, sep="\t", header=False)
+        rel_set.to_csv(args.outPath_expNPruned_rels, index=False, sep="\t", header=False)
+        logger.info(f"Saved {len(rel_set)} expanded and pruned relations to {args.outPath_expNPruned_rels}")
+        logger.info(f"Saved {len(ent_set)} expanded and pruned entities to {args.outPath_expNPruned_ents}")
+
+        logger.info(f"Total amount of Pruned {len(pruned_triplets_df)} triplets")
+        logger.info(f"Saved {len(pruned_triplets_df)} expanded and pruned triplets to {args.outPath_expNPruned_triplets}")
+        pruned_triplets_df.to_csv(args.outPath_expNPruned_triplets, index=False, sep="\t")
 
     if args.mode in ["create_dataset"]:
         # Create dataset splits
 
         triplets: List[StrTriplet] = []
         # Ensure that the expanded triplets file exists
-        if not os.path.exists(args.outPath_expanded_triplet_wo_qualifiers):
+        if not os.path.exists(args.outPath_expNPruned_triplets):
             logger.error(
                 f"Expanded triplets file {args.outPath_expanded_triplet_wo_qualifiers} does not exist."
                 " Please run the pipeline first.A"
@@ -800,7 +858,7 @@ def main():
             exit(-1)
 
         # Load the expanded triplets file
-        with open(args.outPath_expanded_triplet_wo_qualifiers, 'r') as f:
+        with open(args.outPath_expNPruned_triplets, 'r') as f:
             for line_no, line in enumerate(f):
                 if line_no == 0:
                     continue
@@ -810,17 +868,18 @@ def main():
 
         create_dataset_splits(
             triplets,
-            args.train_output,
-            args.test_output,
-            args.valid_output,
+            args.outPath_train_split,
+            args.outPath_test_split,
+            args.outPath_valid_split,
             train_ratio=args.train_ratio,
             test_valid_ratio=args.test_valid_ratio,
             seed=args.seed,
         )
+
     if args.mode in ["multihop_entities_relations"]: 
         # Then we just add some ids at the begining to make it compatible to MultiHopKG graph embedding training
         entitiy_counter = 0
-        with open(args.outPath_expanded_entity_set, 'r') as f:
+        with open(args.outPath_expNPruned_ents, 'r') as f:
             entities = f.readlines()
         dirname = os.path.dirname(args.outPath_expanded_entity_set)
 
@@ -829,15 +888,17 @@ def main():
             for line in entities:
                 f.write(f"{entitiy_counter}\t{line.strip()}\n")
                 entitiy_counter += 1
+        logger.info(f"Saved entities dictionary into {compliant_entities_file_name}")
 
         relation_counter = 0
-        with open(args.outPath_expanded_relation_set, 'r') as f:
+        with open(args.outPath_expNPruned_rels, 'r') as f:
             relations = f.readlines()
         compliant_relations_file_name = os.path.join(dirname, "relations.dict")
         with open(compliant_relations_file_name, 'w') as f:
             for line in relations:
                 f.write(f"{relation_counter}\t{line.strip()}\n")
                 relation_counter += 1
+        logger.info(f"Saved relations dictionary into {compliant_entities_file_name}")
 
 
     #########################################

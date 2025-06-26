@@ -35,7 +35,9 @@ import threading
 from typing import DefaultDict, List, Union, Dict, Tuple, Set
 
 from wikidata.entity import EntityId
+from SPARQLWrapper import SPARQLWrapper, JSON
 
+from utils import sparql_queries
 from utils.basic import load_to_set, sort_by_qid, sort_qid_list
 
 
@@ -445,7 +447,7 @@ def fetch_entity_triplet_for_head(qid: str, mode: str="expanded", limit:int = 10
 
     Returns:
         Triplet Set (Set[Tuple[str, str, str]]): A list of triplets (head, relation, tail) related to the entity
-        Forwarded IDs (Dict[str, str]): Dictionary that forwards old ids to new ones.
+        FOrwarded IDs (Dict[str, str]): Dictionary that forwards old ids to new ones.
         Qualifier Dict (Dict[Tuple[str,str,str],List[str]]]): The dictionary to recover attributes from triplets
 
     """
@@ -552,11 +554,12 @@ def fetch_entity_triplets_for_tail(
     #     f.write(results)
 
     # Dump the response into a json within ./debug directory
-    # with open("debug/qualifiers_sparql.json", "w") as f:
-    #     import json
-    #     json.dump(results, f, indent=4)
+    with open("debug/qualifiers_sparql.json", "w") as f:
+        import json
+        json.dump(results, f, indent=4)
 
-    for result in data.get("results", {}).get("bindings", []):
+    for result in results["results"]["bindings"]: # type: ignore
+        assert isinstance(result, Dict)
         head_uri = result.get("head_uri", {}).get("value", "")
         relation_uri = result.get("property", {}).get("value", "")
         statement_uri = result.get("statement", {}).get("value", "") # Important for grouping
@@ -565,7 +568,6 @@ def fetch_entity_triplets_for_tail(
         relation_pid = relation_uri.split("/")[-1] if relation_uri and relation_uri.startswith("http://www.wikidata.org/entity/P") else None # property URI from statementProperty
 
         if not (head_qid and relation_pid and statement_uri):
-            print(f"Skipping incomplete main triplet data: H:{head_uri}, R:{relation_uri}")
             continue
 
         main_triplet = (head_qid, relation_pid, entity_id) # entity_id is the fixed tail
@@ -584,8 +586,6 @@ def fetch_entity_triplets_for_tail(
         # For now we dont care about non-item qualifiers
         if not qual_value_is_item:
             continue
-        else:
-            print(f"Qualifier value is an item: {qual_value_raw}")
 
         if qual_property_uri and qual_value_raw:
             qual_property_pid = qual_property_uri.split("/")[-1] if qual_property_uri.startswith("http://www.wikidata.org/entity/P") else None # Qualifier properties are PIDs (entities)
@@ -637,85 +637,9 @@ def fetch_entity_triplets_for_tail(
     # for key in qualifiers_map:
     # qualifiers_map[key] = list(set(qualifiers_map[key]))
 
-    final_qualifiers_map = qualifiers_map if mode == 'separate' else defaultdict(list)
+    final_qualifiers_map = qualifiers_map if mode == 'separate' else DefaultDict(list)
     return triplets, forward_dict, final_qualifiers_map
 
-
-def fetch_entity_triplet_as_tail(qid: str, mode: str="expanded") \
-    -> Tuple[Set[Tuple[str, str, str]], Dict[str, str], Dict[Tuple[str,str,str],List[str]]]:
-    """
-    Retrieves the triplet relationships where an entity is the tail (object) on Wikidata.
-    This function uses the Wikidata API to find all entities that reference the given entity.
-
-    Args:
-        qid (str): The QID identifier of the entity to find as a tail.
-
-    Returns:
-        Set[Tuple[str, str, str]]: A list of triplets (head, relation, tail) where the given entity is the tail
-        Dict[str, str]: the forwarding ID if any.
-
-    TODO:
-        Maybe setup qualifiers here as well ?
-    """
-    assert qid and 'Q' == qid[0], "Your QID must be prefixed by a Q"
-
-    client = get_thread_local_client()
-    entity = client.get(EntityId(qid), load=True)
-    
-    forward_dict = {}
-    if entity.id != qid: forward_dict: Dict[str, str] = {entity.id: qid}
-    
-    # Use the actual entity ID for the query
-    entity_id = entity.id
-    
-    # Initialize the set of triplets
-    triplets: set[tuple[str, str, str]] = set()
-    
-    # Construct the SPARQL query to find all entities that reference this entity
-    sparql_query = f"""
-    SELECT ?item ?itemLabel ?property ?propertyLabel WHERE {{
-      ?item ?property wd:{entity_id} .
-      ?item wdt:P31 ?type .  # Only include items that have a type
-      SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en". }}
-    }}
-    """
-    
-    # Execute the query using the Wikidata Query Service
-    url = "https://query.wikidata.org/sparql"
-    params = {
-        "query": sparql_query,
-        "format": "json"
-    }
-    
-    try:
-        response = requests.get(url, params=params, timeout=30)
-        response.raise_for_status()  # Raise an exception for HTTP errors
-
-        
-        data = response.json()
-
-        # Dump data into ./debug really quick:
-        with open("./debug/sparql_query.json", "w") as f:
-            import json
-            json.dump(data, f, indent=4)
-        
-        # Process the results
-        for result in data.get("results", {}).get("bindings", []):
-            head_uri = result.get("item", {}).get("value", "")
-            relation_uri = result.get("property", {}).get("value", "")
-            
-            # Extract the QID and PID from the URIs
-            head_qid = head_uri.split("/")[-1] if head_uri else ""
-            # head_qid = head_qid.split("-")[0] if head_qid else ""
-            relation_pid = relation_uri.split("/")[-1] if relation_uri else ""
-            
-            # Only add valid triplets
-            if head_qid and relation_pid and head_qid.startswith("Q") and relation_pid.startswith("P"):
-    
-    except Exception as e:
-        print(f"Error fetching triplets where {qid} is tail: {e}")
-    
-    return triplets, forward_dict
 
 def fetch_entity_triplet_bidirectional(qid: str, mode: str="expanded") \
     -> Tuple[Set[Tuple[str, str, str]], Dict[str, str], Dict[Tuple[str,str,str],List[str]]]:
@@ -731,14 +655,20 @@ def fetch_entity_triplet_bidirectional(qid: str, mode: str="expanded") \
         Dict[str, str]: the forwarding ID if any.
         Dict[Tuple[str,str,str],List[str]]]: The dictionary to recover attributes from triplets
     """
-    assert mode in ["expanded", "separate", "ignore"], "Invalid mode for fetch_entity_triplet_both."
+    assert mode in ["expanded", "separate", "ignore"], "Invalid mode for fetch_entity_triplet_bidirectional."
     assert qid and 'Q' == qid[0], "Your QID must be prefixed by a Q"
     
     # Get triplets where entity is head
-    head_triplets, forward_dict, qualifier_triplets = fetch_entity_triplet(qid, mode)
+    head_triplets, forward_dict, head_qualifier_triplets = fetch_entity_triplet_for_head(qid, mode)
     
     # Get triplets where entity is tail
-    tail_triplets, tail_forward_dict = fetch_entity_triplet_as_tail(qid)
+
+    # tail_triplets = set()
+    # tail_forward_dict = {}
+    # tail_qualifier_triplets = {}
+    # --- 
+    tail_triplets, tail_forward_dict, tail_qualifier_triplets = fetch_entity_triplets_for_tail(qid, mode)
+
     
     # Merge the forward dictionaries
     forward_dict.update(tail_forward_dict)
@@ -746,7 +676,131 @@ def fetch_entity_triplet_bidirectional(qid: str, mode: str="expanded") \
     # Merge the triplets
     all_triplets = head_triplets.union(tail_triplets)
     
-    return all_triplets, forward_dict, qualifier_triplets
+    # Merge the qualifier triplets dictionaries
+    merged_qualifier_triplets = DefaultDict(list)
+    for triplet, qualifiers in head_qualifier_triplets.items():
+        merged_qualifier_triplets[triplet].extend(qualifiers)
+    for triplet, qualifiers in tail_qualifier_triplets.items():
+        merged_qualifier_triplets[triplet].extend(qualifiers)
+    
+    return all_triplets, forward_dict, merged_qualifier_triplets
+
+
+@deprecated("2025-05-25", "Takes way too long to compute is very resource intensive and wasteful")
+def slow_fetch_entity_triplet_bidirectional(qid: str, mode: str, limit=100) \
+    -> Tuple[Set[Tuple[str, str, str]], Dict[str, str], Dict[Tuple[str,str,str],List[str]]]:
+    """
+    Retrieves all triplet relationships where an entity appears as either head or tail on Wikidata.
+    Warning: Will not do qualifiers for now.
+
+    Args:
+        qid (str): The QID identifier of the entity.
+        mode (str): How to deal with qualifiers
+
+    Returns:
+        Set[Tuple[str, str, str]]: A list of triplets (head, relation, tail) related to the entity
+        forward_dict (Dict[str,str]): Simple remapping of old id into new id according to wikidata.
+        Dict[Tuple[str,str,str],List[str]]]: The dictionary to recover qualifiers from triplets
+    Warning: 
+        Currently not recovering qualifiers
+    """
+    #TODO: qualifiers are not being recovered at the moment.
+    #    Thats because it requires a lot more compute that is not worth at the moment
+    # assert mode in ["expanded", "separate", "ignore"], "Invalid mode for fetch_entity_triplet_bidirectional."
+    assert qid and 'Q' == qid[0], "Your QID must be prefixed by a Q"
+
+    q_pattern = re.compile(r'http://www.wikidata.org/entity/(Q\d+$)')
+    p_pattern = re.compile(r'http://www.wikidata.org/prop/direct/(P\d+$)')
+
+    # Get Forwarding Dict
+    client = get_thread_local_client()
+    entity = client.get(EntityId(qid), load=True)
+    forward_dict = {}
+    if entity.id != qid:
+        forward_dict: Dict[str, str] = {entity.id: qid}
+    new_qid = entity.id
+
+    # Form the payload
+    #print(f"About to for id {new_qid}")
+    endpoint_url = "https://query.wikidata.org/sparql"
+    headers = { 'User-Agent': 'HumbleScraperBot' }
+    payload = {"query": f"DESCRIBE wd:{new_qid}", "format": "json"}
+    
+    # Receive Results
+    r = requests.get(endpoint_url, params=payload, headers=headers)
+    results = r.json()
+
+    tail_triplets = set()
+    head_triplets = set()
+    #print(f"Objtained {len(results['results']['bindings'])} results for qid {new_qid}")
+    for result in results["results"]["bindings"]:   
+        subject_val = q_pattern.search(result["subject"]["value"])
+        predicate_val = p_pattern.search(result["predicate"]["value"])
+        object_val = q_pattern.search(result["object"]["value"])
+        #print(f"Going through result: ({subject_val},{predicate_val},{object_val}) ")
+
+        if subject_val is None \
+           or predicate_val is None \
+           or object_val is None:
+            continue
+
+        if new_qid == subject_val:
+            if len(head_triplets) <= limit:
+                head_triplets.add((subject_val.group(1), predicate_val.group(1), object_val.group(1)))
+        elif new_qid ==object_val:
+            if len(tail_triplets) <= limit:
+                tail_triplets.add((subject_val.group(1), predicate_val.group(1), object_val.group(1)))
+
+    triplets = set()
+    triplets.update(tail_triplets)
+    triplets.update(head_triplets)
+    qualifiers_triplets = {}
+    return triplets, forward_dict, qualifiers_triplets
+
+@deprecated("2025-05-24","Replaced for `fetch_entity_triplet_bidirectional`")
+def old_fetch_entity_triplet_bidirectional(qid: str, mode: str="expanded") \
+    -> Tuple[Set[Tuple[str, str, str]], Dict[str, str], Dict[Tuple[str,str,str],List[str]]]:
+    """
+    Retrieves all triplet relationships where an entity appears as either head or tail on Wikidata.
+
+    Args:
+        qid (str): The QID identifier of the entity.
+        mode (str): Mode of processing triplets. Options are 'expanded', 'separate', 'ignore'.
+
+    Returns:
+        Set[Tuple[str, str, str]]: A list of triplets (head, relation, tail) related to the entity
+        Dict[str, str]: the forwarding ID if any.
+        Dict[Tuple[str,str,str],List[str]]]: The dictionary to recover attributes from triplets
+    """
+    assert mode in ["expanded", "separate", "ignore"], "Invalid mode for fetch_entity_triplet_bidirectional."
+    assert qid and 'Q' == qid[0], "Your QID must be prefixed by a Q"
+    
+    # Get triplets where entity is head
+    head_triplets, forward_dict, head_qualifier_triplets = fetch_entity_triplet_for_head(qid, mode)
+    
+    # Get triplets where entity is tail
+
+    # tail_triplets = set()
+    # tail_forward_dict = {}
+    # tail_qualifier_triplets = {}
+    # --- 
+    tail_triplets, tail_forward_dict, tail_qualifier_triplets = fetch_entity_triplets_for_tail(qid, mode)
+
+    
+    # Merge the forward dictionaries
+    forward_dict.update(tail_forward_dict)
+    
+    # Merge the triplets
+    all_triplets = head_triplets.union(tail_triplets)
+    
+    # Merge the qualifier triplets dictionaries
+    merged_qualifier_triplets = DefaultDict(list)
+    for triplet, qualifiers in head_qualifier_triplets.items():
+        merged_qualifier_triplets[triplet].extend(qualifiers)
+    for triplet, qualifiers in tail_qualifier_triplets.items():
+        merged_qualifier_triplets[triplet].extend(qualifiers)
+    
+    return all_triplets, forward_dict, merged_qualifier_triplets
     
 #------------------------------------------------------------------------------
 'Webscrapping for Relationship Info'
@@ -1108,9 +1162,15 @@ def retry_fetch(func, *args, max_retries=3, timeout=2, verbose=False, **kwargs):
     Returns:
         The function's return value, or raises an exception after retries are exhausted.
     """
+
+    # Start uniformly at random between 0 and 3 seconds
+    next_timeout_wait = random.uniform(0, 3)
+    time.sleep(next_timeout_wait)
     
     last_exception = None
     
+    next_timeout_wait = 5 # For exponential Backoff
+    jitter_size = 4
     for attempt in range(max_retries):
         try:
             # Attempt the function call with a timeout
@@ -1129,8 +1189,15 @@ def retry_fetch(func, *args, max_retries=3, timeout=2, verbose=False, **kwargs):
         except Exception as e:
             last_exception = e
             if verbose: print(f"Error on attempt {attempt + 1} for {args[0]}: {e}. Retrying...")
-        time.sleep(1)  # Optional: wait a bit before retrying
-    if verbose: print(f"Failed after {max_retries} retries for {args[0]}.")
+
+        jitter = random.random() * jitter_size - (jitter_size / 2)
+        timeout_wait = max(next_timeout_wait + jitter, 1) # Just in cas ethe jitter drops me below 0
+        print(f"Sleeping for {timeout_wait} seconds")
+        time.sleep(timeout_wait)  # Optional: wait a bit before retrying
+        next_timeout_wait = next_timeout_wait * 5  
+
+    if verbose: 
+        print(f"Failed after {max_retries} retries for {args[0]}.")
     
     # Raise the last exception encountered if all retries fail
     if last_exception:
