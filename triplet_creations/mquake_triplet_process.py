@@ -29,6 +29,7 @@ Usage:
 
 import argparse
 import ast
+import json
 import os
 import random
 from collections import defaultdict
@@ -53,6 +54,7 @@ QUALIFER_DICT_COLUMNS = ["triplet", "qualifier"]
 CHECKPOINT_ENTITIES_FILENAME = "entities_yet_to_process.txt"
 CHECKPOINT_TRIPLETS_FILENAME = "triplets_proceessed_so_far.csv"
 CHECKPOINT_QUALIFIERS_FILENAME = "qualifiers.csv"
+CHECKPOINT_METADATA_FILENAME = "metadata.json"
 
 
 def parse_args():
@@ -272,12 +274,12 @@ def save_entity_expansion_checkpoint(
         header=not file_exists_qualifiers,
         index=False
     )
-    pd.DataFrame(
-        {
-            QUALIFER_DICT_COLUMNS[0]: list(qualifier_dictionary.keys()),
-            QUALIFER_DICT_COLUMNS[1]: list(qualifier_dictionary.values()),
-        }
-    ).to_csv(path_qualifier_dictionary, index=False)
+
+    # Save metadata
+    metadata: Dict[str, Any] = {}
+    metadata["current_hop"] = current_hop
+    with open(path_metadata_dictionary, 'w') as f:
+        json.dump(metadata, f)
 
 
 def expand_triplet_set(
@@ -599,6 +601,11 @@ def expand_triplets_logistics(
         _chkpntd_qualifier_dictionary = _chkpntd_qualifier_dictionary.values.tolist()
         chkpntd_qualifier_dictionary = {ast.literal_eval(row[0]): ast.literal_eval(row[1]) for row in _chkpntd_qualifier_dictionary}
         logger.info(f"Continuing with the checkpoint files found at {os.path.basename(checkpointing_triplet_expansion_path)}")
+        # Load Metadata
+        with open(entity_expansion_checkpointing_paths["chckpnt_metadata_path"], 'r') as f:
+            metadata = json.load(f)
+            current_hop = metadata["current_hop"]
+            logger.info(f"Continuing from the checkpoint at hop {current_hop}")
     else:
         logger.info(f"Starting from the beginning with {len(entities_to_expand_upon)} entities")
         # _chkpntd_triplets_processed = pd.DataFrame(columns=ETWoQ_COLUMNS)
