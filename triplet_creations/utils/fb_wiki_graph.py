@@ -562,7 +562,7 @@ class FbWikiGraph():
                 rand_part_a = "WITH path LIMIT 1000" if rand else ""
                 rand_part_b = "ORDER BY rand()" if rand else ""
                 
-                limit_part = f"LIMIT {limit}" if (type(limit) == int and limit > 0) else ""
+                limit_part = f"LIMIT {limit}" if (type(limit) is int and limit > 0) else ""
 
                 query = (
                     f"""
