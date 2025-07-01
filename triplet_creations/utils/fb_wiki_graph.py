@@ -23,7 +23,7 @@ from neo4j import GraphDatabase
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 from utils.basic import load_pandas
@@ -503,8 +503,8 @@ class FbWikiGraph():
         self,
         qid_start: str,
         qid_end: str,
-        min_hops: int = 2,
-        max_hops: int = 3,
+        min_hops: Optional[int] = 2,
+        max_hops: Optional[int] = 3,
         limit: int = 1,
         relationship_types: Optional[list[str]] = None,
         noninformative_types: List[str] = [],
@@ -543,7 +543,8 @@ class FbWikiGraph():
             with driver.session(database=self.database) as session:
                 # Construct the query with or without relationship types filtering
                 relationship_filter = ' | '.join(relationship_types) if relationship_types else ""
-                relationship_part = f"[r:{relationship_filter} * {min_hops}..{max_hops}]" if relationship_types else f"[*{min_hops}..{max_hops}]"
+                hops_part = f"{min_hops}..{max_hops}" if min_hops and max_hops else ""
+                relationship_part = f"[r:{relationship_filter} * {hops_part}]" if relationship_types else f"[*{hops_part}]"
                 
                 # Prevents specific relationship types from showing in the paths
                 noninformative_pruning = ", ".join(f"'{item}'" for item in noninformative_types) if noninformative_types else ""
