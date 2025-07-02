@@ -28,11 +28,12 @@ Usage:
 """
 
 import argparse
+import ast
 import os
 import random
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, List, Set
+from typing import Any, Dict, List, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -43,6 +44,14 @@ from utils.logging import create_logger
 from utils.process_triplets import get_relations_and_entities_to_prune
 from utils.wikidata_v2 import fetch_entity_triplet, process_entity_triplets, retry_fetch
 from utils.mquake import extract_mquake_entities
+
+
+ETWQ_COLUMNS = ["head", "rel", "tail", "qualifiers"]
+ETWoQ_COLUMNS = ["head", "rel", "tail"]
+QUALIFER_DICT_COLUMNS = ["triplet", "qualifier"]
+CHECKPOINT_ENTITIES_FILENAME = "entities_yet_to_process.txt"
+CHECKPOINT_TRIPLETS_FILENAME = "triplets_proceessed_so_far.csv"
+CHECKPOINT_QUALIFIERS_FILENAME = "qualifiers.csv"
 
 
 def parse_args():
@@ -205,8 +214,7 @@ def expand_triplet_set(
     max_workers: int, 
     max_retries: int,
     timeout: int,
-    checkpointing_dir: str
-) -> tuple[set[tuple[str, str, str]], dict[tuple,Any]]:
+) -> Tuple[Set[StrTriplet], Dict[tuple,Any]]:
     """
     Expand entity and relation set by finding neighbors of existing entities through WikiData.
     And then create new triplets from the expanded entity set.
@@ -248,9 +256,6 @@ def expand_triplet_set(
         for batch_start in tqdm(batch_steps, desc="Processing Entities"):
 
             # Sometimes getting these triplets makes the entire thing stop so I will store a checkpoint 
-            with open(checkpointing_dir, 'w') as f:
-                f.write("\n".join(entities_to_process))
-
             batch_end = min(batch_start + batch_size, len(entities_to_process))
             batch = entities_to_process[batch_start:batch_end]
             batch = [entity for entity in batch if entity not in processed_entities]
@@ -469,6 +474,112 @@ def filtering_triplets():
     """
     pass
 
+def expand_triplets_logistics(
+    path_og_entities: str,
+    path_triplets_w_qualifier: str,
+    path_expanded_entities: str,
+    path_expanded_relations: str,
+    checkpointing_triplet_expansion_path: str,
+    target_entity_count: int,
+    expansion_hops: int,
+    use_qualifiers_for_expansion: bool,
+    entity_batch_size: int,
+    max_workers: int,
+    max_retries: int,
+    timeout: int,
+) -> None:
+
+    # By default, will just used origina entities.
+    with open(path_og_entities, 'r') as f: 
+        entities_to_expand_upon = {line.strip() for line in f}
+
+    entity_expansion_checkpointing_paths = {
+        "chckpnt_enitity_path" : os.path.join(checkpointing_triplet_expansion_path, CHECKPOINT_ENTITIES_FILENAME),
+        "chckpnt_triplet_path" : os.path.join(checkpointing_triplet_expansion_path, CHECKPOINT_TRIPLETS_FILENAME),
+        "chckpnt_qualifier_path" : os.path.join(checkpointing_triplet_expansion_path, CHECKPOINT_QUALIFIERS_FILENAME),
+    }
+
+    logger.info(f"Expanding the original entity set from {len(entities_to_expand_upon)} initial entities...")
+    all_checkpoint_files_exist = all([os.path.exists(chk_path) for chk_path in entity_expansion_checkpointing_paths.values()])
+    some_checkpoint_files_exist = any([os.path.exists(chk_path) for chk_path in entity_expansion_checkpointing_paths.values()])
+    will_use_checkpoint = False
+
+    if all_checkpoint_files_exist:
+        will_use_checkpoint = input(f"Do you want to continue from the checkpoint at {checkpointing_triplet_expansion_path}? (y/n)").lower() == "y"
+    elif some_checkpoint_files_exist:
+        raise RuntimeError("Not all checkpointing files were found.\n"
+                           "Please make sure that all files are present and run the script again."
+                           )
+
+    if will_use_checkpoint:
+        with open(entity_expansion_checkpointing_paths["chckpnt_enitity_path"], 'r') as f:
+            entities_to_expand_upon = set(f.read().splitlines())
+        _chkpntd_triplets_processed = pd.read_csv(entity_expansion_checkpointing_paths["chckpnt_triplet_path"], header=0)
+        chkpntd_triplets_processed = [(row[0], row[1], row[2]) for row in _chkpntd_triplets_processed.values]
+
+        # Qualifier Dict Special Treatment
+        _chkpntd_qualifier_dictionary = pd.read_csv(entity_expansion_checkpointing_paths["chckpnt_qualifier_path"], header=0)
+
+        _chkpntd_qualifier_dictionary = _chkpntd_qualifier_dictionary.values.tolist()
+        chkpntd_qualifier_dictionary = {ast.literal_eval(row[0]): ast.literal_eval(row[1]) for row in _chkpntd_qualifier_dictionary}
+        logger.info(f"Continuing with the checkpoint files found at {os.path.basename(checkpointing_triplet_expansion_path)}")
+    else:
+        logger.info(f"Starting from the beginning with {len(entities_to_expand_upon)} entities")
+        # _chkpntd_triplets_processed = pd.DataFrame(columns=ETWoQ_COLUMNS)
+        chkpntd_triplets_processed: List[StrTriplet] = []
+
+        # chkpntd_qualifier_dictionary = pd.DataFrame(columns=QUALIFER_DICT_COLUMNS)
+        chkpntd_qualifier_dictionary: Dict[Tuple, List] = {}
+
+        
+    ########################################
+    # Core Logic of Expansion 
+    ########################################
+    expanded_triplets, qualifier_dict = expand_triplet_set(
+        entity_set=entities_to_expand_upon,
+        target_size=target_entity_count,
+        expansion_hops=expansion_hops,
+        use_qualifiers_for_expansion=use_qualifiers_for_expansion,
+        batch_size=entity_batch_size,
+        max_workers=max_workers,
+        max_retries=max_retries,
+        timeout=timeout,
+    )
+
+    expanded_triplets.update(chkpntd_triplets_processed)
+    qualifier_dict.update(chkpntd_qualifier_dictionary)
+    
+    # TODO: Move saving responsability to parent script, not to isolated, reusable, function
+    ########################################
+    # Final Save of Data 
+    ########################################
+    expanded_triplets_w_qualifiers = []
+    expanded_entities = set()
+    expanded_relations = set()
+    for new_triplet in expanded_triplets:
+        if new_triplet in qualifier_dict:
+            expanded_triplets_w_qualifiers.append((*new_triplet, str(qualifier_dict[new_triplet])))
+        else:
+            expanded_triplets_w_qualifiers.append((*new_triplet, ""))
+
+        # Expand the entities and relations
+        expanded_entities.update((new_triplet[0], new_triplet[2]))
+        expanded_relations.add(new_triplet[1])
+
+    expanded_triplets_w_qualifiers_df = pd.DataFrame(expanded_triplets_w_qualifiers, columns=ETWQ_COLUMNS) # type: ignore
+    expanded_triplets_w_qualifiers_df.to_csv(path_triplets_w_qualifier, index=False)
+    logger.info(f"Saved {len(expanded_triplets)} expanded triplets to {path_triplets_w_qualifier}")
+
+    # Dump the expanded entities and relations
+    with open(path_expanded_entities, 'w') as f:
+        for entity in sorted(expanded_entities):
+            f.write(f"{entity}\n")
+    with open(path_expanded_relations, 'w') as f:
+        for relation in sorted(expanded_relations):
+            f.write(f"{relation}\n")
+    logger.info(f"Saved {len(expanded_entities)} expanded entities to {path_expanded_entities}")
+    logger.info(f"Saved {len(expanded_relations)} expanded relations to {path_expanded_relations}")
+
 
 def main():
     """Main function to execute the MQuAKE triplet expansion pipeline."""
@@ -522,53 +633,20 @@ def main():
 
     if args.mode in ['expand_entities', 'full_pipeline']:
         # Load MQuAKE entities if not already extracted in this run
-        mquake_entities = set()
-        with open(args.og_entity_output, 'r') as f:
-            mquake_entities = {line.strip() for line in f}
-
-        # Expand entity set
-        logger.info(f"Expanding the original entity set from {len(mquake_entities)} initial entities...")
-        expanded_triplets, qualifier_dict = expand_triplet_set(
-            mquake_entities,
-            target_size=args.target_entity_count,
-            expansion_hops=args.expansion_hops,
-            use_qualifiers_for_expansion=args.use_qualifiers_for_expansion,
-            batch_size=args.entity_batch_size,
-            max_workers=args.max_workers,
-            max_retries=args.max_retries,
-            timeout=args.timeout,
-            checkpointing_dir=args.checkpointing_dir
+        expand_triplets_logistics(
+            path_og_entities = args.og_entity_output,
+            path_expanded_entities= args.outPath_expanded_entity_set, 
+            path_triplets_w_qualifier = args.outPath_expanded_triplets,
+            path_expanded_relations= args.outPath_expanded_relation_set,
+            checkpointing_triplet_expansion_path = args.checkpointing_triplet_expansion_path,
+            target_entity_count = args.target_entity_count,
+            expansion_hops = args.expansion_hops,
+            use_qualifiers_for_expansion = args.use_qualifiers_for_expansion,
+            entity_batch_size = args.entity_batch_size,
+            max_workers = args.max_workers,
+            max_retries = args.max_retries,
+            timeout = args.max_retries 
         )
-
-        expanded_triplets_w_qualifiers = [] # Henceforth, when needed, abbreviated etwq
-        # Save expanded entities to file using pandas
-        etwq_columns = ["head", "rel", "tail", "qualifiers"]
-        expanded_entities = set()
-        expanded_relations = set()
-        for new_triplet in expanded_triplets:
-            if new_triplet in qualifier_dict:
-                expanded_triplets_w_qualifiers.append((*new_triplet, str(qualifier_dict[new_triplet])))
-            else:
-                expanded_triplets_w_qualifiers.append((*new_triplet, ""))
-
-            # Expand the entities and relations
-            expanded_entities.update((new_triplet[0], new_triplet[2]))
-            expanded_relations.add(new_triplet[1])
-
-        expanded_triplets_w_qualifiers_df = pd.DataFrame(expanded_triplets_w_qualifiers, columns=etwq_columns) # type: ignore
-        expanded_triplets_w_qualifiers_df.to_csv(args.expanded_triplet_output, index=False)
-        logger.info(f"Saved {len(expanded_triplets)} expanded triplets to {args.expanded_triplet_output}")
-
-        # Dump the expanded entities and relations
-        with open(args.expanded_entity_set_output, 'w') as f:
-            for entity in sorted(expanded_entities):
-                f.write(f"{entity}\n")
-        with open(args.expanded_relation_set_output, 'w') as f:
-            for relation in sorted(expanded_relations):
-                f.write(f"{relation}\n")
-        logger.info(f"Saved {len(expanded_entities)} expanded entities to {args.expanded_entity_set_output}")
-        logger.info(f"Saved {len(expanded_relations)} expanded relations to {args.expanded_relation_set_output}")
-
 
     ########################################
     # Post Processing Modes; Mostly for utility:
