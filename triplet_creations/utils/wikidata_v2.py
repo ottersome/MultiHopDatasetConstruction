@@ -32,8 +32,12 @@ from wikidata.client import Client
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 import threading
-from typing import List, Union, Dict, Tuple
+from typing import DefaultDict, List, Union, Dict, Tuple, Set
 
+from wikidata.entity import EntityId
+from SPARQLWrapper import SPARQLWrapper, JSON
+
+from utils import sparql_queries
 from utils.basic import load_to_set, sort_by_qid, sort_qid_list
 
 
@@ -249,7 +253,7 @@ def process_entity_triplets(file_path: Union[str, List[str]], output_file_path: 
         pass
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(retry_fetch, fetch_entity_triplet, entity_list[i0],
+        futures = {executor.submit(retry_fetch, fetch_entity_triplet_for_head, entity_list[i0],
                                    max_retries = max_retries, timeout = timeout, verbose = verbose): i0 for i0 in range(0, entity_list_size)}
 
         for future in tqdm(as_completed(futures), total=len(futures), desc="Fetching Entities Triplets"):
@@ -501,12 +505,16 @@ def fetch_entity_triplet_for_head(qid: str, mode: str="expanded", limit:int = 10
 
     return triplets, forward_dict, qualifier_triplets
 
-def fetch_entity_triplets_and_qualifiers_as_tail_optimized(
+def fetch_entity_triplets_for_tail(
     qid: str, mode: str = "expanded"
 ) -> Tuple[Set[Tuple[str, str, str]], Dict[str, str], Dict[Tuple[str, str, str], List[Tuple[str, str]]]]:
     """
     Retrieves triplets where an entity is the tail, including their qualifiers,
     using a single optimized SPARQL query.
+
+    Warning: The inherent cross product in the query makes it very costly. 
+    Thus it is recommended to run "ignore" for most cases. 
+    You can test this expense by running the query on the entity "Q82955".
     """
     assert mode in ["expanded", "separate", "ignore"], "Invalid mode for fetch_entity_triplet_as_tail."
     assert qid and qid.startswith('Q'), "Your QID must be prefixed by a Q"
@@ -523,68 +531,36 @@ def fetch_entity_triplets_and_qualifiers_as_tail_optimized(
     # For 'separate' mode: maps main triplet to list of (qual_prop_pid, qual_value_id_or_literal)
     qualifiers_map = DefaultDict(list)
 
-    sparql_query = f"""
-    SELECT
-      ?head_uri ?property ?statement
-      ?qual_property_uri ?qual_value ?qual_v_is_item
-      ?pq_uri ?qual_v_node
-      ?first_optional_evaluation ?second_optional_evaluation ?just_for_giggles
-    WHERE {{
-      ?head_uri ?p_direct ?statement .
-      ?statement ?property_statement wd:{entity_id} .
-      ?property wikibase:statementProperty ?property_statement .
-
-     OPTIONAL {{
-      # pg_uri is the qualifier property. e.g. Country, for Boston tail
-      # qual_v_node is the qualifier value. e.g. United States, for Boston tail
-      ?statement ?pq_uri ?qual_v_node .
-      ?qual_property_uri wikibase:qualifier ?pq_uri .
-
-      OPTIONAL {{
-        # Check if the qualifier value node is a wikibase Item (more reliable than wikiPageWikiLink)
-        # ?qual_v_node a wikibase:Item . 
-        ?qual_v_node wdt:P31 ?instance_of_value . # Another reliable check
-
-        BIND(REPLACE(STR(?qual_v_node), "http://www.wikidata.org/entity/", "") AS ?qual_v_temp) # Extract QID
-        BIND(true AS ?qual_v_is_item_temp) # Set to true since it's an Item
-      }}
-      OPTIONAL {{
-        # If qual_v_node is deemed a literal, and the previous check did not pass.
-        FILTER(ISLITERAL(?qual_v_node) && !BOUND(?qual_v_temp))
-        BIND(STR(?qual_v_node) AS ?qual_v_temp)
-        BIND(false AS ?qual_v_is_item_temp)
-      }}
-      BIND(COALESCE(?qual_v_temp, STR(?qual_v_node)) AS ?qual_value)
-      BIND(COALESCE(?qual_v_is_item_temp, false) AS ?qual_v_is_item)
-      BIND(true AS ?just_for_giggles)
-    }}
-
-      # Uncomment for labels, but adds overhead. Process labels from IDs later if needed.
-      # SERVICE wikibase:label {{ bd:serviceParam wikibase:language "[AUTO_LANGUAGE],en". }}
-    }}
-    """
-
-    url = "https://query.wikidata.org/sparql"
-    params = {
-        "query": sparql_query,
-        "format": "json"
-    }
+    if mode == "ignore":
+        # TODO: Maybe you want to parameterize `fetch_entity_triplets_for_tail` to take in limit. 
+        sparql_query = sparql_queries.TAILS_WITHOUT_QUALIFIERS_COMPLICATED.format(entity_id=entity_id, limit=200)
+    else:
+        sparql_query = sparql_queries.TAILS_WITH_QUALIFIERS.format(entity_id=entity_id)
 
     # To group qualifiers by statement if a statement has multiple qualifiers
     # statement_uri -> (main_triplet, list_of_qualifiers)
     temp_statement_data: DefaultDict[tuple, Set[Tuple[str,str]]] = DefaultDict(set)
 
-    # try:
-    response = requests.get(url, params=params, timeout=60) # Increased timeout
-    response.raise_for_status()
-    data = response.json()
+    spq = SPARQLWrapper("https://query.wikidata.org/sparql")
+    spq.setQuery(sparql_query)
+    spq.setReturnFormat(JSON)
+    spq.setMethod("POST")
+    spq.setTimeout(60)
+    query_results = spq.query()
+    results = query_results.convert()
+
+    # Dump raw results for debugging into ./debug directory. But dont even run convert()
+    # with open("debug/qualifiers_sparql.json", "w") as f:
+    #     results = spq.query().response.read()
+    #     f.write(results)
+
     # Dump the response into a json within ./debug directory
     with open("debug/qualifiers_sparql.json", "w") as f:
         import json
-        json.dump(data, f, indent=4)
+        json.dump(results, f, indent=4)
 
-
-    for result in data.get("results", {}).get("bindings", []):
+    for result in results["results"]["bindings"]: # type: ignore
+        assert isinstance(result, Dict)
         head_uri = result.get("head_uri", {}).get("value", "")
         relation_uri = result.get("property", {}).get("value", "")
         statement_uri = result.get("statement", {}).get("value", "") # Important for grouping
@@ -593,7 +569,6 @@ def fetch_entity_triplets_and_qualifiers_as_tail_optimized(
         relation_pid = relation_uri.split("/")[-1] if relation_uri and relation_uri.startswith("http://www.wikidata.org/entity/P") else None # property URI from statementProperty
 
         if not (head_qid and relation_pid and statement_uri):
-            print(f"Skipping incomplete main triplet data: H:{head_uri}, R:{relation_uri}")
             continue
 
         main_triplet = (head_qid, relation_pid, entity_id) # entity_id is the fixed tail
@@ -612,8 +587,6 @@ def fetch_entity_triplets_and_qualifiers_as_tail_optimized(
         # For now we dont care about non-item qualifiers
         if not qual_value_is_item:
             continue
-        else:
-            print(f"Qualifier value is an item: {qual_value_raw}")
 
         if qual_property_uri and qual_value_raw:
             qual_property_pid = qual_property_uri.split("/")[-1] if qual_property_uri.startswith("http://www.wikidata.org/entity/P") else None # Qualifier properties are PIDs (entities)
@@ -665,7 +638,7 @@ def fetch_entity_triplets_and_qualifiers_as_tail_optimized(
     # for key in qualifiers_map:
     # qualifiers_map[key] = list(set(qualifiers_map[key]))
 
-    final_qualifiers_map = qualifiers_map if mode == 'separate' else defaultdict(list)
+    final_qualifiers_map = qualifiers_map if mode == 'separate' else DefaultDict(list)
     return triplets, forward_dict, final_qualifiers_map
 
 
@@ -706,8 +679,6 @@ def fetch_entity_triplet_bidirectional(qid: str, mode: str="expanded") \
     
     return all_triplets, forward_dict, merged_qualifier_triplets
 
-        
-        data = response.json()
 
 def describe_fetch_entity_triplet_bidirectional(qid: str, limit=100) \
     -> Tuple[Set[Tuple[str, str, str]], Dict[str, str], Dict[Tuple[str,str,str],List[str]]]:
@@ -778,6 +749,9 @@ def describe_fetch_entity_triplet_bidirectional(qid: str, limit=100) \
     triplets.update(head_triplets)
     qualifiers_triplets = {}
     return triplets, forward_dict, qualifiers_triplets
+
+@deprecated("2025-05-24","Replaced for `fetch_entity_triplet_bidirectional`")
+def old_fetch_entity_triplet_bidirectional(qid: str, mode: str="expanded") \
     -> Tuple[Set[Tuple[str, str, str]], Dict[str, str], Dict[Tuple[str,str,str],List[str]]]:
     """
     Retrieves all triplet relationships where an entity appears as either head or tail on Wikidata.
@@ -791,14 +765,20 @@ def describe_fetch_entity_triplet_bidirectional(qid: str, limit=100) \
         Dict[str, str]: the forwarding ID if any.
         Dict[Tuple[str,str,str],List[str]]]: The dictionary to recover attributes from triplets
     """
-    assert mode in ["expanded", "separate", "ignore"], "Invalid mode for fetch_entity_triplet_both."
+    assert mode in ["expanded", "separate", "ignore"], "Invalid mode for fetch_entity_triplet_bidirectional."
     assert qid and 'Q' == qid[0], "Your QID must be prefixed by a Q"
     
     # Get triplets where entity is head
-    head_triplets, forward_dict, qualifier_triplets = fetch_entity_triplet(qid, mode)
+    head_triplets, forward_dict, head_qualifier_triplets = fetch_entity_triplet_for_head(qid, mode)
     
     # Get triplets where entity is tail
-    tail_triplets, tail_forward_dict = fetch_entity_triplet_as_tail(qid)
+
+    # tail_triplets = set()
+    # tail_forward_dict = {}
+    # tail_qualifier_triplets = {}
+    # --- 
+    tail_triplets, tail_forward_dict, tail_qualifier_triplets = fetch_entity_triplets_for_tail(qid, mode)
+
     
     # Merge the forward dictionaries
     forward_dict.update(tail_forward_dict)
@@ -806,7 +786,14 @@ def describe_fetch_entity_triplet_bidirectional(qid: str, limit=100) \
     # Merge the triplets
     all_triplets = head_triplets.union(tail_triplets)
     
-    return all_triplets, forward_dict, qualifier_triplets
+    # Merge the qualifier triplets dictionaries
+    merged_qualifier_triplets = DefaultDict(list)
+    for triplet, qualifiers in head_qualifier_triplets.items():
+        merged_qualifier_triplets[triplet].extend(qualifiers)
+    for triplet, qualifiers in tail_qualifier_triplets.items():
+        merged_qualifier_triplets[triplet].extend(qualifiers)
+    
+    return all_triplets, forward_dict, merged_qualifier_triplets
     
 #------------------------------------------------------------------------------
 'Webscrapping for Relationship Info'

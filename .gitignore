@@ -22,3 +22,5 @@ triplet_creations/launch.json
 
 # For Testing
 **playground*
+triplet_creations/new_rdf_tools/wrangling_tool/ttl_chunks
+triplet_creations/debug
